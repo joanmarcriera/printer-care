@@ -13,9 +13,8 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 NoNewPrivileges=yes
-# lp talks to cupsd over its unix socket; connecting works on a read-only mount,
-# but list it explicitly so a tightened ProtectSystem never breaks printing.
-ReadWritePaths=/run/cups
+# lp talks to cupsd over its unix socket in /run/cups; connect() works on a read-only
+# mount, so no ReadWritePaths is needed.
 ProtectKernelTunables=yes
 ProtectControlGroups=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
