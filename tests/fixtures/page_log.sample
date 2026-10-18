@@ -1,0 +1,7 @@
+colour marc 11 [18/Oct/2026:10:30:42 +0100] total 2 192.0.2.5 color one-sided a4 report final.pdf
+black marc 12 [18/Oct/2026:10:31:00 +0100] 1 1 192.0.2.5 monochrome two-sided-long-edge a4 my doc (v2).pdf
+black marc 12 [18/Oct/2026:10:31:02 +0100] 2 1 192.0.2.5 monochrome two-sided-long-edge a4 my doc (v2).pdf
+colour root 13 [17/Oct/2026:09:00:00 +0100] 1 1 localhost color one-sided a4 printer-care-keepalive
+colour root 13 [17/Oct/2026:09:00:00 +0100] total 1 localhost color one-sided a4 printer-care-keepalive
+colour marc 14 [16/Oct/2026:08:00:00 +0100] 1 1 192.0.2.7 - one-sided a4 legacy job
+black marc 5 [01/Aug/2026:10:00:00 +0100] total 9 192.0.2.5 monochrome one-sided a4 too old

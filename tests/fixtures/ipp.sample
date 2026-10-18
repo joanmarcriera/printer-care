@@ -1,0 +1,3 @@
+    marker-colors (1setOf nameWithoutLanguage) = #FF00FF,#00FFFF,#FFFF00,#000000
+    marker-levels (1setOf integer) = 99,99,99,50
+    marker-names (1setOf nameWithoutLanguage) = M,C,Y,BK
