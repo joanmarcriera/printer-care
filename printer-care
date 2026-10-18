@@ -21,7 +21,8 @@
 #   printer-care -h | --help
 #
 # Config: ${PRINTER_CARE_CONF:-/etc/printer-care.conf}, KEY=VALUE lines (never sourced;
-#   unknown keys are ignored). Environment variables of the same name override the file.
+#   unknown keys are ignored; trailing ' # comments' are stripped, quotes keep a literal #).
+#   Environment variables of the same name override the file.
 #   COLOUR_HOST COLOUR_QUEUE(colour) COLOUR_USB_ID(04f9:0767)
 #   BLACK_HOST  BLACK_QUEUE(black)   BLACK_USB_ID(04f9:009e)
 #   SNMP_COMMUNITY(public) KEEPALIVE_DAYS(7) LOW_INK_PERCENT(15)
@@ -67,7 +68,15 @@ have() { command -v "$1" >/dev/null 2>&1; }
 usage() { sed -n '2,/^$/{/^#/s/^# \{0,1\}//p;}' "$SELF"; }
 
 # ---------------------------------------------------------------- time
-now_epoch() { printf '%s' "${PRINTER_CARE_NOW:-$(date +%s)}"; }
+# is_int VALUE - guard for every value that came from the network, a file or the
+# environment before it reaches (( )), $(( )) or 16#: bash evaluates `a[$(cmd)]`
+# inside arithmetic, so unvalidated data there is command execution.
+is_int() { [[ ${1-} =~ ^-?[0-9]+$ ]]; }
+is_uint() { [[ ${1-} =~ ^[0-9]+$ ]]; }
+
+now_epoch() {
+  if is_uint "${PRINTER_CARE_NOW:-}"; then printf '%s' "$PRINTER_CARE_NOW"; else date +%s; fi
+}
 
 # fmt_epoch EPOCH [FORMAT]  - GNU date first, BSD date as fallback.
 fmt_epoch() {
@@ -77,6 +86,7 @@ fmt_epoch() {
 
 # days_between FROM TO  - whole days elapsed (never negative).
 days_between() {
+  if ! is_uint "$1" || ! is_uint "$2"; then printf 0; return 0; fi
   local d=$(( ($2 - $1) / 86400 ))
   (( d < 0 )) && d=0
   printf '%s' "$d"
@@ -90,7 +100,8 @@ days_between() {
 parse_kv() {
   local file=$1 keys=" $2 " envwins=${3:-0} line key val
   local re_line='^[[:space:]]*([A-Z][A-Z0-9_]*)[[:space:]]*=(.*)$'
-  local re_dq='^"(.*)"$' re_sq="^'(.*)'\$"
+  local re_dq='^"([^"]*)"([[:space:]]+#.*)?$' re_sq="^'([^']*)'([[:space:]]+#.*)?\$"
+  local re_cm0='^#.*$' re_cm='^(.*[^[:space:]])[[:space:]]+#.*$'
   [[ -r $file ]] || return 0
   while IFS= read -r line || [[ -n $line ]]; do
     line=${line%$'\r'}
@@ -100,8 +111,12 @@ parse_kv() {
     [[ $keys == *" $key "* ]] || continue
     val=${val#"${val%%[![:space:]]*}"}
     val=${val%"${val##*[![:space:]]}"}
+    # Quoted value (optionally followed by a comment) is taken verbatim; an unquoted
+    # value ends at the first whitespace-then-# (so URLs with a #fragment survive).
     if [[ $val =~ $re_dq ]]; then val=${BASH_REMATCH[1]}
-    elif [[ $val =~ $re_sq ]]; then val=${BASH_REMATCH[1]}; fi
+    elif [[ $val =~ $re_sq ]]; then val=${BASH_REMATCH[1]}
+    elif [[ $val =~ $re_cm0 ]]; then val=
+    elif [[ $val =~ $re_cm ]]; then val=${BASH_REMATCH[1]}; fi
     if (( envwins )) && [[ -n "${!key+x}" ]]; then continue; fi
     printf -v "$key" '%s' "$val"
   done < "$file"
@@ -160,17 +175,21 @@ notify() {
   have curl || { warn "curl missing; cannot notify"; return 0; }
   body=$(printf '{"event":"%s","printer":"%s","message":"%s","host":"%s"}' \
     "$(json_escape "$ev")" "$(json_escape "$printer")" "$(json_escape "$msg")" "$(json_escape "$(hostname)")")
-  curl -fsS -m 10 -X POST -H 'Content-Type: application/json' -d "$body" "$HA_WEBHOOK_URL" >/dev/null \
+  # URL goes to curl on stdin (-K -), not argv, so it never shows in `ps`.
+  local url=${HA_WEBHOOK_URL//\\/\\\\}; url=${url//\"/\\\"}
+  printf 'url = "%s"\n' "$url" \
+    | curl -fsS -m 10 -X POST -H 'Content-Type: application/json' -d "$body" -K - >/dev/null \
     || warn "webhook delivery failed (ignored)"
   return 0
 }
 
 # ---------------------------------------------------------------- SNMP / Brother TLV
 # norm_hex STRING - strip snmpget decoration ("<oid> = Hex-STRING:"), quotes and line
-# wraps; upper-case; single-space separated bytes.
+# wraps; upper-case; single-space separated bytes. Only two-hex-digit tokens survive,
+# so nothing but [0-9A-F ] ever reaches the 16# arithmetic in decode_tlv.
 norm_hex() {
   printf '%s' "$1" | tr '\r\n"' '   ' | sed -e 's/^.*Hex-STRING:[[:space:]]*//' \
-    | tr 'a-f' 'A-F' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+    | tr 'a-f' 'A-F' | awk '{ for (i = 1; i <= NF; i++) if ($i ~ /^[0-9A-F][0-9A-F]$/) { printf "%s%s", sep, $i; sep = " " } }'
 }
 
 # decode_tlv HEX CODE - Brother blobs are repeated records
@@ -179,6 +198,7 @@ norm_hex() {
 decode_tlv() {
   local want code len v j i=0 n
   local -a toks=()
+  [[ ${2#0[xX]} =~ ^[0-9A-Fa-f]{1,2}$ ]] || return 1
   want=$(printf '%02X' "$((16#${2#0[xX]}))")
   read -r -a toks <<< "$(norm_hex "$1")" || true
   n=${#toks[@]}
@@ -212,7 +232,7 @@ read_counters() {
   local hex t c m d
   hex=$(snmp_hex "$1" "$OID_COUNTERS") || return 1
   t=$(decode_tlv "$hex" 00) || return 1
-  c=$(decode_tlv "$hex" 02 || echo 0)
+  c=$(decode_tlv "$hex" 02) || return 1   # no colour record: not a colour counter, do not guess 0
   m=$(decode_tlv "$hex" 01 || echo 0)
   d=$(decode_tlv "$hex" 06 || echo 0)
   printf '%s %s %s %s\n' "$t" "$c" "$m" "$d"
@@ -229,7 +249,7 @@ ink_from_maint() {
 }
 
 # pct_ceil LEVEL MAX -> percentage rounded up (Brother's web page rounds up too).
-pct_ceil() { (( $2 > 0 && $1 >= 0 )) || return 1; printf '%s' $(( (100 * $1 + $2 - 1) / $2 )); }
+pct_ceil() { is_int "$1" && is_int "$2" && (( $2 > 0 && $1 >= 0 )) || return 1; printf '%s' $(( (100 * $1 + $2 - 1) / $2 )); }
 
 # drum_percent HOST - from the Printer-MIB supplies table: find the row whose
 # description mentions "Drum", then level/max (both must be positive).
@@ -250,7 +270,14 @@ markers_parse() {
   awk '
     /^[[:space:]]*marker-names / { sub(/^[^=]*= */, ""); nn = split($0, nm, ",") }
     /^[[:space:]]*marker-levels / { sub(/^[^=]*= */, ""); nl = split($0, lv, ",") }
-    END { for (i = 1; i <= nn; i++) print nm[i], (i <= nl ? lv[i] : "-1") }'
+    END {
+      for (i = 1; i <= nn; i++) {
+        name = nm[i]; gsub(/[^A-Za-z0-9_-]/, "", name); if (name == "") name = "x"
+        lvl = (i <= nl) ? lv[i] : "-1"
+        if (lvl !~ /^-?[0-9]+$/) lvl = "-1"      # untrusted: only integers get through
+        print name, lvl
+      }
+    }'
 }
 
 ipp_markers() {
@@ -270,18 +297,30 @@ queue_state() {
   printf '%s\n' "${o:-n/a (queue not found)}"
 }
 pending_count() { have lpstat || { echo n/a; return 0; }; lpstat -o "$1" 2>/dev/null | grep -c . || true; }
-job_pending() {   # QUEUE JOBID -> 1 if that job is still queued
-  have lpstat || { echo 0; return 0; }
-  lpstat -o "$1" 2>/dev/null | awk -v j="$2" '$1 == j { f = 1 } END { print f + 0 }'
+
+# lpstat_o QUEUE - `lpstat -o` output; non-zero when it cannot be determined. Callers must
+# treat failure as "unknown" (never as "queue is empty"). PRINTER_CARE_LPSTAT_O (a file, or
+# the word "fail") replaces lpstat in tests.
+lpstat_o() {
+  if [[ -n ${PRINTER_CARE_LPSTAT_O:-} ]]; then
+    [[ $PRINTER_CARE_LPSTAT_O != fail ]] || return 1
+    cat "$PRINTER_CARE_LPSTAT_O"; return 0
+  fi
+  have lpstat || return 1
+  lpstat -o "$1" 2>/dev/null
 }
+# job_listed JOBID - stdin: lpstat -o output -> 1 if the job is listed, else 0
+job_listed() { awk -v j="$1" '$1 == j { f = 1 } END { print f + 0 }'; }
 
 # ---------------------------------------------------------------- decision logic (pure)
 # decide_keepalive NOW CHANGED_AT DAYS PENDING -> print | wait | stuck
-#   due = at least DAYS whole days since colour last changed.
+#   CHANGED_AT is the later of 'colour counter last rose' and 'last keep-alive queued', so a
+#   keep-alive always restarts the window: at most one per DAYS whatever else happens.
+#   due = at least DAYS whole days since then.
 #   A keep-alive job that is still queued when one is due means paper/ink/offline trouble.
 decide_keepalive() {
   local now=$1 changed=$2 days=$3 pending=${4:-0}
-  [[ -n $changed ]] || { echo wait; return 0; }
+  if ! is_uint "$now" || ! is_uint "$changed" || ! is_uint "$days" || ! is_uint "$pending"; then echo wait; return 0; fi
   if (( $(days_between "$changed" "$now") >= days )); then
     if (( pending > 0 )); then echo stuck; else echo print; fi
   else
@@ -292,6 +331,7 @@ decide_keepalive() {
 # apply_counter COUNT NOW - update the colour clock (mutates COLOUR_COUNT/COLOUR_CHANGED_AT).
 apply_counter() {
   local count=$1 now=$2
+  is_uint "$count" && is_uint "$now" || return 1
   if [[ -z $COLOUR_CHANGED_AT ]]; then COLOUR_CHANGED_AT=$now; COLOUR_COUNT=$count   # first run: seed
   elif [[ -z $COLOUR_COUNT ]]; then COLOUR_COUNT=$count                                # clock seeded blind
   elif (( count > COLOUR_COUNT )); then COLOUR_COUNT=$count; COLOUR_CHANGED_AT=$now    # colour printed
@@ -351,7 +391,7 @@ print_ps() {
 
 # ---------------------------------------------------------------- actions
 do_keepalive() {
-  local usb id now; now=$(now_epoch)
+  local usb id now fresh; now=$(now_epoch)
   [[ -n $COLOUR_HOST || -n ${PRINTER_CARE_SNMP_FIXTURE:-} ]] || die 1 "COLOUR_HOST not set"
   usb=$(usb_present "$COLOUR_USB_ID")
   if [[ $usb == no ]]; then
@@ -359,15 +399,26 @@ do_keepalive() {
     return 3
   fi
   if (( DRY )); then log "[dry-run] would print keep-alive on queue '$COLOUR_QUEUE' (usb: $usb)"; return 0; fi
+  # Baseline for later verification: a fresh read, stored only if it succeeded.
+  if fresh=$(colour_count_now); then COUNT_AT_KEEPALIVE=$fresh; COLOUR_COUNT=$fresh
+  else COUNT_AT_KEEPALIVE=''; warn "counter unreadable before keep-alive; it will not be verified"; fi
   id=$(gen_ps colour "printer-care keep-alive" "$(stamp keep-alive)" \
         | print_ps "$COLOUR_QUEUE" printer-care-keepalive -o print-color-mode=color -o ColorModel=RGB) || {
     notify keepalive_failed "Could not queue keep-alive page on '$COLOUR_QUEUE'" colour; return 3; }
-  LAST_KEEPALIVE_AT=$now; LAST_KEEPALIVE_JOB=$id; COUNT_AT_KEEPALIVE=${COLOUR_COUNT:-0}
+  LAST_KEEPALIVE_AT=$now; LAST_KEEPALIVE_JOB=$id
   notify keepalive_printed "Keep-alive page queued as $id" colour
 }
 
+# last_activity - later of the last colour change and the last keep-alive (the window start)
+last_activity() {
+  local a=${COLOUR_CHANGED_AT:-} b=${LAST_KEEPALIVE_AT:-}
+  if [[ -z $a ]]; then printf '%s' "$b"
+  elif [[ -n $b ]] && (( b > a )); then printf '%s' "$b"
+  else printf '%s' "$a"; fi
+}
+
 cmd_check() {
-  local now count="" rc=0 kpend=0 verdict
+  local now count="" rc=0 kpend=0 verdict jobs last lpok=1
   [[ ${1:-} == --dry-run ]] && DRY=1
   [[ $# -le 1 ]] || die 1 "usage: printer-care check [--dry-run]"
   [[ -n $COLOUR_HOST || -n ${PRINTER_CARE_SNMP_FIXTURE:-} ]] || die 1 "COLOUR_HOST not set (see printer-care.conf.example)"
@@ -381,34 +432,41 @@ cmd_check() {
     count=""; SNMP_MISSES=$(( SNMP_MISSES + 1 ))
     warn "colour counter unreadable (miss #$SNMP_MISSES)"
     [[ -n $COLOUR_CHANGED_AT ]] || COLOUR_CHANGED_AT=$now
-    if (( SNMP_MISSES == 3 )); then
-      notify counter_unreadable "Colour page counter unreadable 3 runs in a row" colour; rc=3
+    # 3rd consecutive miss, then every 7th after that (10, 17, ...)
+    if (( SNMP_MISSES == 3 || (SNMP_MISSES > 3 && (SNMP_MISSES - 3) % 7 == 0) )); then
+      notify counter_unreadable "Colour page counter unreadable for $SNMP_MISSES runs in a row" colour; rc=3
     fi
   fi
 
-  # 2. self-verify the previous keep-alive: queued still? did the counter move?
-  if [[ -n $LAST_KEEPALIVE_JOB ]]; then
-    if [[ $(job_pending "$COLOUR_QUEUE" "$LAST_KEEPALIVE_JOB") == 1 ]]; then
-      kpend=1
-    elif [[ -n $count && -n $COUNT_AT_KEEPALIVE ]]; then
-      if (( count <= COUNT_AT_KEEPALIVE )) && (( now - ${LAST_KEEPALIVE_AT:-0} > 3600 )); then
-        notify keepalive_not_counted "Keep-alive $LAST_KEEPALIVE_JOB left the queue but the colour counter did not rise (stuck at $count)" colour; rc=3
-      else
-        log "keep-alive $LAST_KEEPALIVE_JOB verified (counter $COUNT_AT_KEEPALIVE -> $count)"
-      fi
-      LAST_KEEPALIVE_JOB=""
-    fi
-  fi
-
-  # 3. decide
-  if (( kpend )) && (( now - ${LAST_KEEPALIVE_AT:-0} < 3600 )); then
-    log "keep-alive $LAST_KEEPALIVE_JOB still printing (queued <1h ago)"
+  # 2. what does the queue look like? A failing lpstat means UNKNOWN: verify and print nothing.
+  if jobs=$(lpstat_o "$COLOUR_QUEUE"); then
+    [[ -n $LAST_KEEPALIVE_JOB ]] && kpend=$(printf '%s\n' "$jobs" | job_listed "$LAST_KEEPALIVE_JOB")
   else
-    verdict=$(decide_keepalive "$now" "$COLOUR_CHANGED_AT" "$KEEPALIVE_DAYS" "$kpend")
+    lpok=0; warn "cannot query CUPS queue '$COLOUR_QUEUE' (lpstat failed); skipping verification and printing this run"
+  fi
+
+  # 3. self-verify the previous keep-alive once it has left the queue
+  if (( lpok )) && [[ -n $LAST_KEEPALIVE_JOB ]] && (( ! kpend )); then
+    if [[ -n $count && -n $COUNT_AT_KEEPALIVE ]]; then
+      if (( count > COUNT_AT_KEEPALIVE )); then
+        log "keep-alive $LAST_KEEPALIVE_JOB verified (counter $COUNT_AT_KEEPALIVE -> $count)"; LAST_KEEPALIVE_JOB=""
+      elif (( now - ${LAST_KEEPALIVE_AT:-0} > 3600 )); then
+        notify keepalive_not_counted "Keep-alive $LAST_KEEPALIVE_JOB left the queue but the colour counter did not rise (still $count); next attempt in $KEEPALIVE_DAYS days" colour
+        rc=3; LAST_KEEPALIVE_JOB=""
+      fi    # else: finished <1h ago, the counter may lag - look again next run
+    else
+      log "keep-alive $LAST_KEEPALIVE_JOB left the queue (counter not comparable; not verified)"; LAST_KEEPALIVE_JOB=""
+    fi
+  fi
+
+  # 4. decide, from the later of last colour change and last keep-alive
+  if (( lpok )); then
+    last=$(last_activity)
+    verdict=$(decide_keepalive "$now" "$last" "$KEEPALIVE_DAYS" "$kpend")
     case $verdict in
       print) log "no colour for >= $KEEPALIVE_DAYS days: keep-alive due"; do_keepalive || rc=3 ;;
       stuck) notify keepalive_stuck "Keep-alive job $LAST_KEEPALIVE_JOB is still queued - check paper, ink, power" colour; rc=3 ;;
-      wait)  log "ok: next keep-alive due $(fmt_epoch $(( COLOUR_CHANGED_AT + KEEPALIVE_DAYS * 86400 )))" ;;
+      wait)  log "ok: next keep-alive due $(fmt_epoch $(( last + KEEPALIVE_DAYS * 86400 )))" ;;
     esac
   fi
   state_save
@@ -416,13 +474,14 @@ cmd_check() {
 }
 
 cmd_keepalive() {
-  local force=0 a rc=0 now verdict kpend=0
+  local force=0 a rc=0 now verdict kpend=0 jobs
   for a in "$@"; do case $a in
     --force) force=1 ;; --dry-run) DRY=1 ;; *) die 1 "usage: printer-care keepalive [--force] [--dry-run]" ;; esac; done
   now=$(now_epoch); state_load
   if (( ! force )); then
-    [[ -n $LAST_KEEPALIVE_JOB ]] && kpend=$(job_pending "$COLOUR_QUEUE" "$LAST_KEEPALIVE_JOB")
-    verdict=$(decide_keepalive "$now" "$COLOUR_CHANGED_AT" "$KEEPALIVE_DAYS" "$kpend")
+    jobs=$(lpstat_o "$COLOUR_QUEUE") || { log "cannot query CUPS queue; use --force to print anyway"; return 3; }
+    [[ -z $LAST_KEEPALIVE_JOB ]] || kpend=$(printf '%s\n' "$jobs" | job_listed "$LAST_KEEPALIVE_JOB")
+    verdict=$(decide_keepalive "$now" "$(last_activity)" "$KEEPALIVE_DAYS" "$kpend")
     [[ $verdict == print ]] || { log "keep-alive not needed ($verdict); use --force to print anyway"; return 0; }
   fi
   do_keepalive || rc=$?
@@ -527,7 +586,7 @@ kv() { printf '  %-20s %s\n' "$1" "$2"; }
 fmt_markers() {   # stdin "NAME LEVEL" -> "M 99%  C 99%  (LOW)"
   local n l out=""
   while read -r n l; do
-    if (( l < 0 )); then out+="$n ?  "
+    if ! is_int "$l" || (( l < 0 )); then out+="$n ?  "
     elif (( l < LOW_INK_PERCENT )); then out+="$n ${l}% LOW  "
     else out+="$n ${l}%  "; fi
   done
@@ -559,7 +618,7 @@ cmd_status() {
   if [[ -n $COLOUR_CHANGED_AT ]]; then
     days=$(days_between "$COLOUR_CHANGED_AT" "$now")
     kv "last colour" "$days day(s) ago ($(fmt_epoch "$COLOUR_CHANGED_AT"))"
-    kv "next keep-alive due" "$(fmt_epoch $(( COLOUR_CHANGED_AT + KEEPALIVE_DAYS * 86400 ))) (every ${KEEPALIVE_DAYS}d without colour)"
+    kv "next keep-alive due" "$(fmt_epoch $(( $(last_activity) + KEEPALIVE_DAYS * 86400 ))) (every ${KEEPALIVE_DAYS}d without colour)"
   else kv "last colour" "unknown (no state yet - run 'check')"; fi
   [[ -z $LAST_KEEPALIVE_AT ]] || kv "last keep-alive" "$(fmt_epoch "$LAST_KEEPALIVE_AT") job ${LAST_KEEPALIVE_JOB:-verified}"
   echo
