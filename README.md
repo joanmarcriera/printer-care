@@ -85,8 +85,10 @@ is last because it may contain spaces. Per-page and `total` lines are both handl
 
 `--dry-run` never prints, never writes state and never sends notifications; it logs what it would do.
 
-Exit codes: `0` ok, `1` usage/config error, `2` printer/host unreachable, `3` action needed or failed
-(so a failed systemd run is visible in `systemctl --failed`).
+Exit codes: `0` ok, `1` usage/config error, `2` a printer/host was unreachable (`status`),
+`3` action needed or failed. For `check`, `3` means this run raised an alert: the 3rd (then every
+7th) consecutive unreadable counter, a stuck or uncounted keep-alive, a missing USB device, or a
+failed print. A failed run shows in `systemctl --failed`.
 
 ## Configuration
 
@@ -94,21 +96,27 @@ Exit codes: `0` ok, `1` usage/config error, `2` printer/host unreachable, `3` ac
 `KEY=VALUE`, parsed with a whitelist and **never sourced or evaluated**. Environment variables
 of the same name win over the file. Keys: `COLOUR_HOST`, `COLOUR_QUEUE`, `COLOUR_USB_ID`,
 `BLACK_HOST`, `BLACK_QUEUE`, `BLACK_USB_ID`, `SNMP_COMMUNITY`, `KEEPALIVE_DAYS` (7),
-`LOW_INK_PERCENT` (15), `HA_WEBHOOK_URL`, `PAGE_LOG`.
+`LOW_INK_PERCENT` (15), `HA_WEBHOOK_URL`, `PAGE_LOG`. Trailing `# comments` after whitespace are allowed; wrap a value in quotes to keep a literal ` #`.
 
 State is `/var/lib/printer-care/state` (atomic KEY=VALUE writes). Test/override hooks:
-`PRINTER_CARE_CONF`, `PRINTER_CARE_STATE_DIR`, `PRINTER_CARE_NOW`, `PRINTER_CARE_SNMP_FIXTURE`.
+`PRINTER_CARE_CONF`, `PRINTER_CARE_STATE_DIR`, `PRINTER_CARE_NOW`, `PRINTER_CARE_SNMP_FIXTURE`, `PRINTER_CARE_LPSTAT_O` (tests). The webhook URL is passed to curl on stdin so it does not appear in `ps`.
 
 ## How detection works
 
 1. Read the counters blob (a hex string of `code 01 04 <uint32>` records ended by `FF`;
-   codes `00` total, `01` mono, `02` colour, `06` duplex).
+   codes `00` total, `01` mono, `02` colour, `06` duplex). A blob without a colour record is rejected.
 2. Colour counter higher than stored -> record "colour changed now". First run seeds the clock.
-3. Previous keep-alive: still queued -> `keepalive_stuck` (if due again); gone but counter not
-   above the value at print time -> `keepalive_not_counted`.
-4. Counter unreadable -> keep using stored timestamps; `counter_unreadable` fires only on the 3rd
-   consecutive miss (one flaky SNMP packet is not an alert).
-5. >= `KEEPALIVE_DAYS` since the last change -> print. USB device missing -> skip and send `printer_absent`.
+3. The window start is the **later of the last colour change and the last keep-alive**. When
+   `KEEPALIVE_DAYS` have passed since then, print. Because a keep-alive restarts the window, there is
+   **at most one keep-alive per window** whatever goes wrong (SNMP down, job cancelled, counter flat),
+   so a fault cannot burn paper.
+4. After printing, the baseline counter is read fresh and stored. Once the job leaves the queue: counter
+   above baseline -> verified; flat -> `keepalive_not_counted` (no reprint until the next window); baseline
+   or counter unknown -> noted, not verified. Still queued after a whole window -> `keepalive_stuck`.
+5. If `lpstat` itself fails the queue state is *unknown*: that run neither verifies nor prints.
+6. Counter unreadable -> stored timestamps are used; `counter_unreadable` fires on the 3rd consecutive
+   miss, then every 7th (10th, 17th, ...).
+7. USB device missing -> skip and send `printer_absent`.
 
 Ink and toner levels come from IPP `marker-levels`/`marker-names` (the standard Printer-MIB
 supply levels report "unknown" on some Brother ink-tank models). The laser's drum percentage
