@@ -1,0 +1,634 @@
+#!/usr/bin/env bash
+# printer-care - keep a USB-attached Brother colour ink-tank printer from drying out
+#                (and keep an eye on a mono laser) from a CUPS print server.
+#
+# Why: inkjet nozzles dry when no colour is printed for a while. The printer's own
+# colour page counter (read over SNMP) is the source of truth, so colour pages from
+# copies, Wi-Fi prints or other machines count too - not just jobs that went
+# through this CUPS server. When the counter has not moved for KEEPALIVE_DAYS, a
+# tiny, ink-frugal colour page is printed.
+#
+# Usage:
+#   printer-care status                       both printers: USB, queue, ink, counters, next due
+#   printer-care check [--dry-run]            timer entry point: update clock, print keep-alive if due
+#   printer-care keepalive [--force] [--dry-run]
+#                                             print the keep-alive page (refuses if not due, unless --force)
+#   printer-care test-page colour|black [--dry-run]
+#   printer-care jobs                         pending and recently completed jobs
+#   printer-care cancel-stuck [--yes]         cancel jobs older than 1 hour on both queues
+#   printer-care history [days]               page_log summary (default 30 days)
+#   printer-care care                         manual maintenance cheat-sheet (panel menus)
+#   printer-care -h | --help
+#
+# Config: ${PRINTER_CARE_CONF:-/etc/printer-care.conf}, KEY=VALUE lines (never sourced;
+#   unknown keys are ignored). Environment variables of the same name override the file.
+#   COLOUR_HOST COLOUR_QUEUE(colour) COLOUR_USB_ID(04f9:0767)
+#   BLACK_HOST  BLACK_QUEUE(black)   BLACK_USB_ID(04f9:009e)
+#   SNMP_COMMUNITY(public) KEEPALIVE_DAYS(7) LOW_INK_PERCENT(15)
+#   HA_WEBHOOK_URL(empty = no notifications) PAGE_LOG(/var/log/cups/page_log)
+# State:  ${PRINTER_CARE_STATE_DIR:-/var/lib/printer-care}/state (KEY=VALUE, atomic writes)
+# Other env: PRINTER_CARE_NOW (epoch override), PRINTER_CARE_SNMP_FIXTURE (file holding the
+#   counters hex string, for tests), PRINTER_CARE_SNMP_FIXTURE_MAINT (same, maintenance OID).
+#
+# Exit codes: 0 ok | 1 usage/config error | 2 printer/host unreachable | 3 action needed or failed
+#
+# Examples:
+#   printer-care status
+#   printer-care check --dry-run
+#   printer-care keepalive --force
+#   PRINTER_CARE_CONF=./my.conf printer-care history 7
+#
+# Portability: bash >= 3.2 (macOS /bin/bash works), awk = POSIX/mawk-safe (no gawk extensions).
+# Brother-specific: counters come from the private OID 1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.10.0.
+
+set -euo pipefail
+
+VERSION=0.1.0
+SELF=${BASH_SOURCE[0]}
+
+# Brother private OIDs: TLV blobs (see decode_tlv).
+OID_COUNTERS=1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.10.0
+OID_MAINT=1.3.6.1.4.1.2435.2.3.9.4.2.1.5.5.8.0
+# Standard Printer-MIB: page counter and marker-supplies table.
+OID_PAGECOUNT=1.3.6.1.2.1.43.10.2.1.4.1.1
+OID_SUPPLY_DESC=1.3.6.1.2.1.43.11.1.1.6
+OID_SUPPLY_MAX=1.3.6.1.2.1.43.11.1.1.8
+OID_SUPPLY_LVL=1.3.6.1.2.1.43.11.1.1.9
+
+CONF_KEYS="COLOUR_HOST COLOUR_QUEUE COLOUR_USB_ID BLACK_HOST BLACK_QUEUE BLACK_USB_ID SNMP_COMMUNITY KEEPALIVE_DAYS LOW_INK_PERCENT HA_WEBHOOK_URL PAGE_LOG"
+STATE_KEYS="COLOUR_COUNT COLOUR_CHANGED_AT LAST_KEEPALIVE_AT LAST_KEEPALIVE_JOB COUNT_AT_KEEPALIVE SNMP_MISSES"
+DRY=0   # 1 = never print, never write state, never notify
+
+# ---------------------------------------------------------------- logging
+log()  { printf 'printer-care: %s\n' "$*"; }
+warn() { printf 'printer-care: %s\n' "$*" >&2; }
+die()  { local rc=$1; shift; warn "$*"; exit "$rc"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+usage() { sed -n '2,/^$/{/^#/s/^# \{0,1\}//p;}' "$SELF"; }
+
+# ---------------------------------------------------------------- time
+now_epoch() { printf '%s' "${PRINTER_CARE_NOW:-$(date +%s)}"; }
+
+# fmt_epoch EPOCH [FORMAT]  - GNU date first, BSD date as fallback.
+fmt_epoch() {
+  local f=${2:-%Y-%m-%d %H:%M}
+  date -d "@$1" "+$f" 2>/dev/null || date -r "$1" "+$f"
+}
+
+# days_between FROM TO  - whole days elapsed (never negative).
+days_between() {
+  local d=$(( ($2 - $1) / 86400 ))
+  (( d < 0 )) && d=0
+  printf '%s' "$d"
+}
+
+# ---------------------------------------------------------------- safe KEY=VALUE parser
+# parse_kv FILE "KEY KEY ..." ENV_WINS
+# Only whitelisted keys are read; values are taken literally (never evaluated), so
+# `FOO=$(touch x)` is ignored and `COLOUR_QUEUE=$(touch x)` is just an odd string.
+# With ENV_WINS=1 a variable already present in the environment is not overwritten.
+parse_kv() {
+  local file=$1 keys=" $2 " envwins=${3:-0} line key val
+  local re_line='^[[:space:]]*([A-Z][A-Z0-9_]*)[[:space:]]*=(.*)$'
+  local re_dq='^"(.*)"$' re_sq="^'(.*)'\$"
+  [[ -r $file ]] || return 0
+  while IFS= read -r line || [[ -n $line ]]; do
+    line=${line%$'\r'}
+    [[ $line =~ $re_line ]] || continue
+    key=${BASH_REMATCH[1]}
+    val=${BASH_REMATCH[2]}
+    [[ $keys == *" $key "* ]] || continue
+    val=${val#"${val%%[![:space:]]*}"}
+    val=${val%"${val##*[![:space:]]}"}
+    if [[ $val =~ $re_dq ]]; then val=${BASH_REMATCH[1]}
+    elif [[ $val =~ $re_sq ]]; then val=${BASH_REMATCH[1]}; fi
+    if (( envwins )) && [[ -n "${!key+x}" ]]; then continue; fi
+    printf -v "$key" '%s' "$val"
+  done < "$file"
+}
+
+load_config() {
+  CONF_FILE=${PRINTER_CARE_CONF:-/etc/printer-care.conf}
+  STATE_DIR=${PRINTER_CARE_STATE_DIR:-/var/lib/printer-care}
+  STATE_FILE=$STATE_DIR/state
+  parse_kv "$CONF_FILE" "$CONF_KEYS" 1
+  : "${COLOUR_HOST:=}" "${COLOUR_QUEUE:=colour}" "${COLOUR_USB_ID:=04f9:0767}"
+  : "${BLACK_HOST:=}" "${BLACK_QUEUE:=black}" "${BLACK_USB_ID:=04f9:009e}"
+  : "${SNMP_COMMUNITY:=public}" "${KEEPALIVE_DAYS:=7}" "${LOW_INK_PERCENT:=15}"
+  : "${HA_WEBHOOK_URL:=}" "${PAGE_LOG:=/var/log/cups/page_log}"
+  [[ $KEEPALIVE_DAYS =~ ^[0-9]+$ && $KEEPALIVE_DAYS -ge 1 ]] || die 1 "KEEPALIVE_DAYS must be a positive integer (got '$KEEPALIVE_DAYS')"
+  [[ $LOW_INK_PERCENT =~ ^[0-9]+$ ]] || die 1 "LOW_INK_PERCENT must be an integer (got '$LOW_INK_PERCENT')"
+}
+
+# ---------------------------------------------------------------- state
+state_load() {
+  local k
+  COLOUR_COUNT='' COLOUR_CHANGED_AT='' LAST_KEEPALIVE_AT='' LAST_KEEPALIVE_JOB='' COUNT_AT_KEEPALIVE='' SNMP_MISSES=''
+  parse_kv "$STATE_FILE" "$STATE_KEYS" 0
+  for k in COLOUR_COUNT COLOUR_CHANGED_AT LAST_KEEPALIVE_AT COUNT_AT_KEEPALIVE SNMP_MISSES; do
+    [[ ${!k} =~ ^[0-9]*$ ]] || printf -v "$k" '%s' ''
+  done
+  [[ $LAST_KEEPALIVE_JOB =~ ^[A-Za-z0-9_.-]*$ ]] || LAST_KEEPALIVE_JOB=
+  : "${SNMP_MISSES:=0}"; [[ -n $SNMP_MISSES ]] || SNMP_MISSES=0
+}
+
+# Atomic write: temp file in the same directory, then rename. No-op in dry-run.
+state_save() {
+  (( DRY )) && return 0
+  local tmp k
+  mkdir -p "$STATE_DIR"
+  tmp=$(mktemp "$STATE_DIR/.state.XXXXXX")
+  for k in $STATE_KEYS; do printf '%s=%s\n' "$k" "${!k}"; done > "$tmp"
+  mv -f "$tmp" "$STATE_FILE"
+}
+
+# ---------------------------------------------------------------- notifications
+json_escape() {
+  local s=$1
+  s=$(printf '%s' "$s" | LC_ALL=C tr -d '\000-\010\013\014\016-\037')
+  s=${s//\\/\\\\}; s=${s//\"/\\\"}
+  s=${s//$'\n'/\\n}; s=${s//$'\r'/\\r}; s=${s//$'\t'/\\t}
+  printf '%s' "$s"
+}
+
+# notify EVENT MESSAGE [PRINTER]   - never fatal.
+notify() {
+  local ev=$1 msg=$2 printer=${3:-colour} body
+  if (( DRY )); then log "[dry-run] would notify $ev: $msg"; return 0; fi
+  log "event $ev: $msg"
+  [[ -n ${HA_WEBHOOK_URL:-} ]] || return 0
+  have curl || { warn "curl missing; cannot notify"; return 0; }
+  body=$(printf '{"event":"%s","printer":"%s","message":"%s","host":"%s"}' \
+    "$(json_escape "$ev")" "$(json_escape "$printer")" "$(json_escape "$msg")" "$(json_escape "$(hostname)")")
+  curl -fsS -m 10 -X POST -H 'Content-Type: application/json' -d "$body" "$HA_WEBHOOK_URL" >/dev/null \
+    || warn "webhook delivery failed (ignored)"
+  return 0
+}
+
+# ---------------------------------------------------------------- SNMP / Brother TLV
+# norm_hex STRING - strip snmpget decoration ("<oid> = Hex-STRING:"), quotes and line
+# wraps; upper-case; single-space separated bytes.
+norm_hex() {
+  printf '%s' "$1" | tr '\r\n"' '   ' | sed -e 's/^.*Hex-STRING:[[:space:]]*//' \
+    | tr 'a-f' 'A-F' | tr -s ' ' | sed -e 's/^ //' -e 's/ $//'
+}
+
+# decode_tlv HEX CODE - Brother blobs are repeated records
+#   <code:1> <type:1> <len:1> <len bytes, big-endian>   ... terminated by FF.
+# Prints the decimal value of the first record with the given code (hex, e.g. 02).
+decode_tlv() {
+  local want code len v j i=0 n
+  local -a toks=()
+  want=$(printf '%02X' "$((16#${2#0[xX]}))")
+  read -r -a toks <<< "$(norm_hex "$1")" || true
+  n=${#toks[@]}
+  while (( i + 2 < n )); do
+    code=${toks[i]}
+    [[ $code == FF ]] && break
+    len=$((16#${toks[i+2]}))
+    (( i + 3 + len <= n )) || break
+    if [[ $code == "$want" ]]; then
+      v=0
+      for (( j = 0; j < len; j++ )); do v=$(( v * 256 + 16#${toks[i+3+j]} )); done
+      printf '%s' "$v"; return 0
+    fi
+    i=$(( i + 3 + len ))
+  done
+  return 1
+}
+
+# snmp_hex HOST OID [FIXTURE_ENV_VAR] -> normalised hex on stdout; 1 on failure.
+snmp_hex() {
+  local host=$1 oid=$2 fixvar=${3:-PRINTER_CARE_SNMP_FIXTURE} out
+  if [[ -n ${!fixvar:-} ]]; then norm_hex "$(cat "${!fixvar}")"; return 0; fi
+  have snmpget || return 1
+  out=$(snmpget -v2c -c "$SNMP_COMMUNITY" -On -Ox -t 3 -r 1 "$host" "$oid" 2>/dev/null) || return 1
+  [[ $out == *Hex-STRING* ]] || return 1
+  norm_hex "$out"
+}
+
+# read_counters HOST -> "total colour mono duplex" (missing codes print 0)
+read_counters() {
+  local hex t c m d
+  hex=$(snmp_hex "$1" "$OID_COUNTERS") || return 1
+  t=$(decode_tlv "$hex" 00) || return 1
+  c=$(decode_tlv "$hex" 02 || echo 0)
+  m=$(decode_tlv "$hex" 01 || echo 0)
+  d=$(decode_tlv "$hex" 06 || echo 0)
+  printf '%s %s %s %s\n' "$t" "$c" "$m" "$d"
+}
+
+colour_count_now() { local r t c; r=$(read_counters "$COLOUR_HOST") || return 1; read -r t c _ <<< "$r"; printf '%s' "$c"; }
+
+# ink_from_maint HEX -> "K=99 C=99 M=99 Y=99". Codes 0x81..0x84 = black/cyan/magenta/
+# yellow ink remaining % (per the Home Assistant `brother` library's const.py).
+ink_from_maint() {
+  local k c m y
+  k=$(decode_tlv "$1" 81) && c=$(decode_tlv "$1" 82) && m=$(decode_tlv "$1" 83) && y=$(decode_tlv "$1" 84) || return 1
+  printf 'K=%s C=%s M=%s Y=%s' "$k" "$c" "$m" "$y"
+}
+
+# pct_ceil LEVEL MAX -> percentage rounded up (Brother's web page rounds up too).
+pct_ceil() { (( $2 > 0 && $1 >= 0 )) || return 1; printf '%s' $(( (100 * $1 + $2 - 1) / $2 )); }
+
+# drum_percent HOST - from the Printer-MIB supplies table: find the row whose
+# description mentions "Drum", then level/max (both must be positive).
+drum_percent() {
+  local idx lvl max
+  have snmpwalk || return 1
+  idx=$(snmpwalk -v2c -c "$SNMP_COMMUNITY" -On -t 3 -r 1 "$1" "$OID_SUPPLY_DESC" 2>/dev/null \
+    | awk '/[Dd]rum/ { n = split($1, a, "."); print a[n]; exit }') || true
+  [[ -n $idx ]] || return 1
+  lvl=$(snmpget -v2c -c "$SNMP_COMMUNITY" -Oqv -t 3 -r 1 "$1" "$OID_SUPPLY_LVL.1.$idx" 2>/dev/null) || return 1
+  max=$(snmpget -v2c -c "$SNMP_COMMUNITY" -Oqv -t 3 -r 1 "$1" "$OID_SUPPLY_MAX.1.$idx" 2>/dev/null) || return 1
+  [[ $lvl =~ ^-?[0-9]+$ && $max =~ ^-?[0-9]+$ ]] || return 1
+  pct_ceil "$lvl" "$max"
+}
+
+# markers_parse - stdin: `ipptool -tv` output; prints "NAME LEVEL" per marker.
+markers_parse() {
+  awk '
+    /^[[:space:]]*marker-names / { sub(/^[^=]*= */, ""); nn = split($0, nm, ",") }
+    /^[[:space:]]*marker-levels / { sub(/^[^=]*= */, ""); nl = split($0, lv, ",") }
+    END { for (i = 1; i <= nn; i++) print nm[i], (i <= nl ? lv[i] : "-1") }'
+}
+
+ipp_markers() {
+  have ipptool || return 1
+  ipptool -T 5 -tv "ipp://$1/ipp/print" get-printer-attributes.test 2>/dev/null | markers_parse
+}
+
+# ---------------------------------------------------------------- CUPS / USB helpers
+usb_present() {   # yes | no | unknown (no lsusb, e.g. macOS); PRINTER_CARE_USB overrides (tests)
+  [[ -z ${PRINTER_CARE_USB:-} ]] || { echo "$PRINTER_CARE_USB"; return 0; }
+  have lsusb || { echo unknown; return 0; }
+  if lsusb -d "$1" >/dev/null 2>&1; then echo yes; else echo no; fi
+}
+queue_state() {
+  local o; have lpstat || { echo "n/a"; return 0; }
+  o=$(lpstat -p "$1" 2>/dev/null | head -n 1) || true
+  printf '%s\n' "${o:-n/a (queue not found)}"
+}
+pending_count() { have lpstat || { echo n/a; return 0; }; lpstat -o "$1" 2>/dev/null | grep -c . || true; }
+job_pending() {   # QUEUE JOBID -> 1 if that job is still queued
+  have lpstat || { echo 0; return 0; }
+  lpstat -o "$1" 2>/dev/null | awk -v j="$2" '$1 == j { f = 1 } END { print f + 0 }'
+}
+
+# ---------------------------------------------------------------- decision logic (pure)
+# decide_keepalive NOW CHANGED_AT DAYS PENDING -> print | wait | stuck
+#   due = at least DAYS whole days since colour last changed.
+#   A keep-alive job that is still queued when one is due means paper/ink/offline trouble.
+decide_keepalive() {
+  local now=$1 changed=$2 days=$3 pending=${4:-0}
+  [[ -n $changed ]] || { echo wait; return 0; }
+  if (( $(days_between "$changed" "$now") >= days )); then
+    if (( pending > 0 )); then echo stuck; else echo print; fi
+  else
+    echo wait
+  fi
+}
+
+# apply_counter COUNT NOW - update the colour clock (mutates COLOUR_COUNT/COLOUR_CHANGED_AT).
+apply_counter() {
+  local count=$1 now=$2
+  if [[ -z $COLOUR_CHANGED_AT ]]; then COLOUR_CHANGED_AT=$now; COLOUR_COUNT=$count   # first run: seed
+  elif [[ -z $COLOUR_COUNT ]]; then COLOUR_COUNT=$count                                # clock seeded blind
+  elif (( count > COLOUR_COUNT )); then COLOUR_COUNT=$count; COLOUR_CHANGED_AT=$now    # colour printed
+  elif (( count < COLOUR_COUNT )); then COLOUR_COUNT=$count                            # counter reset: re-baseline
+  fi
+}
+
+# ---------------------------------------------------------------- page generation
+ps_escape() { printf '%s' "$1" | LC_ALL=C tr -cd '[:print:]' | sed 's/[\\()]/\\&/g'; }
+
+# gen_ps colour|mono LINE1 [LINE2]  - A4 PostScript. Colour variant: thin C/M/Y bars and
+# hairlines (a few hundred nozzles each, almost no ink); all text is plain black (K only).
+gen_ps() {
+  local kind=$1 l1 l2
+  l1=$(ps_escape "$2"); l2=$(ps_escape "${3:-}")
+  cat <<PS
+%!PS-Adobe-3.0
+%%Title: printer-care
+%%BoundingBox: 0 0 595 842
+%%Pages: 1
+%%EndComments
+%%Page: 1 1
+0 setgray
+/Courier findfont 9 scalefont setfont
+80 790 moveto ($l1) show
+80 778 moveto ($l2) show
+PS
+  if [[ $kind == colour ]]; then
+    cat <<'PS'
+/hl { /yy exch def 0.25 setlinewidth 3 { newpath 80 yy moveto 480 yy lineto stroke /yy yy 4 sub def } repeat } def
+0 1 1 setrgbcolor 80 740 400 6 rectfill
+1 0 1 setrgbcolor 80 725 400 6 rectfill
+1 1 0 setrgbcolor 80 710 400 6 rectfill
+0 1 1 setrgbcolor 690 hl
+1 0 1 setrgbcolor 670 hl
+1 1 0 setrgbcolor 650 hl
+PS
+  fi
+  printf 'showpage\n%%%%EOF\n'
+}
+
+stamp() {   # stamp LABEL -> one text line: label, date, host, counters
+  local c='counters n/a' r t cc mo
+  if r=$(read_counters "$COLOUR_HOST" 2>/dev/null); then read -r t cc mo _ <<< "$r"; c="total=$t colour=$cc mono=$mo"; fi
+  printf '%s | %s | %s | %s' "$1" "$(fmt_epoch "$(now_epoch)" '%Y-%m-%d %H:%M')" "$(hostname)" "$c"
+}
+
+# print_ps QUEUE TITLE EXTRA_LP_ARGS... (PS on stdin) -> prints job id on stdout
+print_ps() {
+  local q=$1 title=$2 out id; shift 2
+  have lp || { warn "lp not found (is CUPS installed?)"; return 1; }
+  out=$(lp -d "$q" "$@" -t "$title" - 2>&1) || { warn "lp failed: $out"; return 1; }
+  id=$(printf '%s\n' "$out" | sed -n 's/^request id is \([^ ]*\).*/\1/p')
+  [[ -n $id ]] || { warn "could not parse job id from: $out"; return 1; }
+  printf '%s' "$id"
+}
+
+# ---------------------------------------------------------------- actions
+do_keepalive() {
+  local usb id now; now=$(now_epoch)
+  [[ -n $COLOUR_HOST || -n ${PRINTER_CARE_SNMP_FIXTURE:-} ]] || die 1 "COLOUR_HOST not set"
+  usb=$(usb_present "$COLOUR_USB_ID")
+  if [[ $usb == no ]]; then
+    notify printer_absent "Colour printer ($COLOUR_USB_ID) not on USB; keep-alive skipped" colour
+    return 3
+  fi
+  if (( DRY )); then log "[dry-run] would print keep-alive on queue '$COLOUR_QUEUE' (usb: $usb)"; return 0; fi
+  id=$(gen_ps colour "printer-care keep-alive" "$(stamp keep-alive)" \
+        | print_ps "$COLOUR_QUEUE" printer-care-keepalive -o print-color-mode=color -o ColorModel=RGB) || {
+    notify keepalive_failed "Could not queue keep-alive page on '$COLOUR_QUEUE'" colour; return 3; }
+  LAST_KEEPALIVE_AT=$now; LAST_KEEPALIVE_JOB=$id; COUNT_AT_KEEPALIVE=${COLOUR_COUNT:-0}
+  notify keepalive_printed "Keep-alive page queued as $id" colour
+}
+
+cmd_check() {
+  local now count="" rc=0 kpend=0 verdict
+  [[ ${1:-} == --dry-run ]] && DRY=1
+  [[ $# -le 1 ]] || die 1 "usage: printer-care check [--dry-run]"
+  [[ -n $COLOUR_HOST || -n ${PRINTER_CARE_SNMP_FIXTURE:-} ]] || die 1 "COLOUR_HOST not set (see printer-care.conf.example)"
+  now=$(now_epoch); state_load
+
+  # 1. read the counter; fall back to stored timestamps when SNMP is unreachable
+  if count=$(colour_count_now); then
+    SNMP_MISSES=0; apply_counter "$count" "$now"
+    log "colour counter $count; last colour change $(fmt_epoch "$COLOUR_CHANGED_AT")"
+  else
+    count=""; SNMP_MISSES=$(( SNMP_MISSES + 1 ))
+    warn "colour counter unreadable (miss #$SNMP_MISSES)"
+    [[ -n $COLOUR_CHANGED_AT ]] || COLOUR_CHANGED_AT=$now
+    if (( SNMP_MISSES == 3 )); then
+      notify counter_unreadable "Colour page counter unreadable 3 runs in a row" colour; rc=3
+    fi
+  fi
+
+  # 2. self-verify the previous keep-alive: queued still? did the counter move?
+  if [[ -n $LAST_KEEPALIVE_JOB ]]; then
+    if [[ $(job_pending "$COLOUR_QUEUE" "$LAST_KEEPALIVE_JOB") == 1 ]]; then
+      kpend=1
+    elif [[ -n $count && -n $COUNT_AT_KEEPALIVE ]]; then
+      if (( count <= COUNT_AT_KEEPALIVE )) && (( now - ${LAST_KEEPALIVE_AT:-0} > 3600 )); then
+        notify keepalive_not_counted "Keep-alive $LAST_KEEPALIVE_JOB left the queue but the colour counter did not rise (stuck at $count)" colour; rc=3
+      else
+        log "keep-alive $LAST_KEEPALIVE_JOB verified (counter $COUNT_AT_KEEPALIVE -> $count)"
+      fi
+      LAST_KEEPALIVE_JOB=""
+    fi
+  fi
+
+  # 3. decide
+  if (( kpend )) && (( now - ${LAST_KEEPALIVE_AT:-0} < 3600 )); then
+    log "keep-alive $LAST_KEEPALIVE_JOB still printing (queued <1h ago)"
+  else
+    verdict=$(decide_keepalive "$now" "$COLOUR_CHANGED_AT" "$KEEPALIVE_DAYS" "$kpend")
+    case $verdict in
+      print) log "no colour for >= $KEEPALIVE_DAYS days: keep-alive due"; do_keepalive || rc=3 ;;
+      stuck) notify keepalive_stuck "Keep-alive job $LAST_KEEPALIVE_JOB is still queued - check paper, ink, power" colour; rc=3 ;;
+      wait)  log "ok: next keep-alive due $(fmt_epoch $(( COLOUR_CHANGED_AT + KEEPALIVE_DAYS * 86400 )))" ;;
+    esac
+  fi
+  state_save
+  return "$rc"
+}
+
+cmd_keepalive() {
+  local force=0 a rc=0 now verdict kpend=0
+  for a in "$@"; do case $a in
+    --force) force=1 ;; --dry-run) DRY=1 ;; *) die 1 "usage: printer-care keepalive [--force] [--dry-run]" ;; esac; done
+  now=$(now_epoch); state_load
+  if (( ! force )); then
+    [[ -n $LAST_KEEPALIVE_JOB ]] && kpend=$(job_pending "$COLOUR_QUEUE" "$LAST_KEEPALIVE_JOB")
+    verdict=$(decide_keepalive "$now" "$COLOUR_CHANGED_AT" "$KEEPALIVE_DAYS" "$kpend")
+    [[ $verdict == print ]] || { log "keep-alive not needed ($verdict); use --force to print anyway"; return 0; }
+  fi
+  do_keepalive || rc=$?
+  state_save
+  return "$rc"
+}
+
+cmd_testpage() {
+  local which=${1:-} a id; shift || true
+  for a in "$@"; do if [[ $a == --dry-run ]]; then DRY=1; else die 1 "usage: printer-care test-page colour|black [--dry-run]"; fi; done
+  case $which in
+    colour|color)
+      (( DRY )) && { log "[dry-run] would print colour test page on '$COLOUR_QUEUE'"; return 0; }
+      id=$(gen_ps colour "printer-care test page (colour)" "$(stamp test-page)" \
+        | print_ps "$COLOUR_QUEUE" printer-care-test -o print-color-mode=color -o ColorModel=RGB) || return 3 ;;
+    black|mono)
+      (( DRY )) && { log "[dry-run] would print mono test page on '$BLACK_QUEUE'"; return 0; }
+      id=$(gen_ps mono "printer-care test page (black)" "$(stamp test-page)" \
+        | print_ps "$BLACK_QUEUE" printer-care-test) || return 3 ;;
+    *) die 1 "usage: printer-care test-page colour|black [--dry-run]" ;;
+  esac
+  log "queued $id"
+}
+
+cmd_jobs() {
+  have lpstat || die 2 "lpstat not found (CUPS client tools required)"
+  echo "== pending"; lpstat -o || true
+  echo "== recently completed"; lpstat -W completed -o | tail -n 10 || true
+}
+
+cmd_cancel_stuck() {
+  local yes=0 a q id user rest ts age stuck=() now ans
+  for a in "$@"; do if [[ $a == --yes ]]; then yes=1; else die 1 "usage: printer-care cancel-stuck [--yes]"; fi; done
+  have lpstat || die 2 "lpstat not found"
+  now=$(now_epoch)
+  for q in "$COLOUR_QUEUE" "$BLACK_QUEUE"; do
+    while read -r id user _ rest; do
+      [[ -n $id ]] || continue
+      ts=$(date -d "$rest" +%s 2>/dev/null) || { warn "cannot parse date of $id ('$rest'); skipped"; continue; }
+      age=$(( now - ts ))
+      (( age > 3600 )) && stuck+=("$id") && log "stuck: $id ($user, $(( age / 60 )) min old)"
+    done < <(lpstat -o "$q" 2>/dev/null || true)
+  done
+  (( ${#stuck[@]} )) || { log "no jobs older than 1 hour"; return 0; }
+  if (( ! yes )); then read -r -p "Cancel ${#stuck[@]} job(s)? [y/N] " ans; [[ $ans == [yY]* ]] || return 3; fi
+  for id in "${stuck[@]}"; do cancel "$id" && log "cancelled $id"; done
+}
+
+# history_summary FILE CUTOFF(YYYYMMDDHHMMSS) -> "queue pages colour mono other last_colour(14 digits or -)"
+# page_log line (see README for the PageLogFormat):
+#   $1 queue $2 user $3 job $4 "[dd/Mon/yyyy:HH:MM:SS" $5 "+0100]" $6 page-or-"total" $7 copies
+#   $8 host $9 print-color-mode $10 sides $11 media $12.. job-name
+# A job may log per-page lines, a "total" line, or both: total wins, otherwise pages are summed.
+history_summary() {
+  awk -v cutoff="$2" '
+    BEGIN {
+      n = split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", mm, " ")
+      for (i = 1; i <= n; i++) mon[mm[i]] = sprintf("%02d", i)
+    }
+    {
+      t = $4; sub(/^\[/, "", t)
+      if (split(t, a, /[\/:]/) < 6 || !(a[2] in mon)) next
+      key = a[3] mon[a[2]] a[1] a[4] a[5] a[6]
+      if ((key "") < (cutoff "")) next
+      id = $1 SUBSEP $3
+      c = ($7 ~ /^[0-9]+$/) ? $7 + 0 : 1
+      if ($6 == "total") { tot[id] += c; hastot[id] = 1 } else pp[id] += c
+      qn[id] = $1; mode[id] = $9; if ((key "") > (lt[id] "")) lt[id] = key
+      seen[id] = 1
+    }
+    END {
+      for (id in seen) {
+        q = qn[id]; p = hastot[id] ? tot[id] : pp[id]; pages[q] += p
+        if (mode[id] ~ /colo/ && mode[id] !~ /mono/) { col[q] += p; if ((lt[id] "") > (last[q] "")) last[q] = lt[id] }
+        else if (mode[id] ~ /mono/) mono[q] += p
+        else oth[q] += p
+        qs[q] = 1
+      }
+      for (q in qs) printf "%s %d %d %d %d %s\n", q, pages[q], col[q], mono[q], oth[q], (last[q] == "" ? "-" : last[q])
+    }' "$1" | sort
+}
+
+cmd_history() {
+  local days=${1:-30} cutoff q pages col mono oth last
+  [[ $days =~ ^[0-9]+$ ]] || die 1 "usage: printer-care history [days]"
+  if [[ ! -r $PAGE_LOG ]]; then
+    log "page_log not readable at $PAGE_LOG - enable it in cupsd.conf (see README: PageLogFormat) and restart CUPS"
+    return 0
+  fi
+  cutoff=$(fmt_epoch $(( $(now_epoch) - days * 86400 )) %Y%m%d%H%M%S)
+  printf 'Last %s days from %s\n' "$days" "$PAGE_LOG"
+  printf '%-12s %6s %7s %7s %6s  %s\n' queue pages colour mono other last-colour
+  while read -r q pages col mono oth last; do
+    [[ $last == - ]] || last="${last:0:4}-${last:4:2}-${last:6:2} ${last:8:2}:${last:10:2}"
+    printf '%-12s %6s %7s %7s %6s  %s\n' "$q" "$pages" "$col" "$mono" "$oth" "$last"
+  done < <(history_summary "$PAGE_LOG" "$cutoff")
+}
+
+# ---------------------------------------------------------------- status
+kv() { printf '  %-20s %s\n' "$1" "$2"; }
+
+fmt_markers() {   # stdin "NAME LEVEL" -> "M 99%  C 99%  (LOW)"
+  local n l out=""
+  while read -r n l; do
+    if (( l < 0 )); then out+="$n ?  "
+    elif (( l < LOW_INK_PERCENT )); then out+="$n ${l}% LOW  "
+    else out+="$n ${l}%  "; fi
+  done
+  printf '%s' "${out:-n/a}"
+}
+
+status_common() {   # NAME HOST QUEUE USBID
+  kv host "${2:-<not configured>}"
+  kv "USB ($4)" "$(usb_present "$4")"
+  kv "CUPS queue" "$3: $(queue_state "$3")"
+  kv "pending jobs" "$(pending_count "$3")"
+}
+
+cmd_status() {
+  local rc=0 now r m i d t c mo du days
+  now=$(now_epoch); state_load
+  echo "Colour printer"
+  if [[ -n $COLOUR_HOST ]]; then
+    status_common colour "$COLOUR_HOST" "$COLOUR_QUEUE" "$COLOUR_USB_ID"
+    m=$(ipp_markers "$COLOUR_HOST" 2>/dev/null | fmt_markers) || m="n/a"
+    if [[ $m == "n/a" ]] && i=$(ink_from_maint "$(snmp_hex "$COLOUR_HOST" "$OID_MAINT" PRINTER_CARE_SNMP_FIXTURE_MAINT)" 2>/dev/null); then
+      m="$i (SNMP fallback)"
+    fi
+    kv "ink" "${m:-n/a}"
+    if r=$(read_counters "$COLOUR_HOST"); then
+      read -r t c mo du <<< "$r"; kv counters "total $t | colour $c | mono $mo | duplex $du"
+    else kv counters "unreachable (SNMP)"; rc=2; fi
+  else kv host "<not configured>"; fi
+  if [[ -n $COLOUR_CHANGED_AT ]]; then
+    days=$(days_between "$COLOUR_CHANGED_AT" "$now")
+    kv "last colour" "$days day(s) ago ($(fmt_epoch "$COLOUR_CHANGED_AT"))"
+    kv "next keep-alive due" "$(fmt_epoch $(( COLOUR_CHANGED_AT + KEEPALIVE_DAYS * 86400 ))) (every ${KEEPALIVE_DAYS}d without colour)"
+  else kv "last colour" "unknown (no state yet - run 'check')"; fi
+  [[ -z $LAST_KEEPALIVE_AT ]] || kv "last keep-alive" "$(fmt_epoch "$LAST_KEEPALIVE_AT") job ${LAST_KEEPALIVE_JOB:-verified}"
+  echo
+  echo "Black (mono laser) printer"
+  if [[ -n $BLACK_HOST ]]; then
+    status_common black "$BLACK_HOST" "$BLACK_QUEUE" "$BLACK_USB_ID"
+    m=$(ipp_markers "$BLACK_HOST" 2>/dev/null | fmt_markers) || m="n/a"
+    kv "toner (IPP)" "${m:-n/a}"
+    if d=$(drum_percent "$BLACK_HOST" 2>/dev/null); then kv drum "${d}%"; else kv drum "n/a"; fi
+    if t=$(snmpget -v2c -c "$SNMP_COMMUNITY" -Oqv -t 3 -r 1 "$BLACK_HOST" "$OID_PAGECOUNT" 2>/dev/null); then
+      kv "page counter" "$t"
+    else kv "page counter" "unreachable (SNMP)"; rc=2; fi
+  else kv host "<not configured>"; fi
+  return "$rc"
+}
+
+cmd_care() {
+  cat <<'TXT'
+Manual maintenance cheat-sheet (menu names vary slightly by firmware - confirm in the
+printer manual at support.brother.com; these paths are from general knowledge of
+Brother's ink-tank and laser menus, not scraped from your exact firmware).
+
+Brother DCP-T780DW (ink-tank colour)
+  Print-quality check   Settings > Maintenance > Improve Print Quality > Check Print Quality
+                        Prints a pattern page: broken or missing lines = clogged nozzles.
+  Head cleaning         Settings > Maintenance > Improve Print Quality > Cleaning
+                        Choose Black, Colour or All. Escalate Normal -> Strong -> Strongest
+                        only if the check sheet still shows gaps; cleaning uses ink and the
+                        waste-ink box, so do not run it "just in case".
+  After refilling       Refill each tank to the line, then answer the on-screen prompt
+                        (Settings > Ink > Ink Volume / "Did you refill?") so the printer
+                        resets its ink counter. Skipping this causes the "No ink" /
+                        "Replace ink" error with full tanks: the counter is simply stale.
+  Idle care             Print some colour at least weekly (that is what `printer-care`
+                        automates). Never power off at the wall; use the power button so
+                        the head parks and caps.
+
+Brother HL-L2350DW (mono laser)
+  Toner low / replace   Panel shows "Toner Low", then "Replace Toner". Pages remain after
+                        "low" (check `printer-care status`); swap the cartridge only when it
+                        says replace or print goes pale. Shaking the cartridge side to side
+                        can buy some pages.
+  Drum                  Drum Unit is separate from toner. After fitting a new drum unit:
+                        OK/Go > hold the Go/Cancel key (or Settings > Machine Info >
+                        Reset Parts Life > Drum) to reset the counter. Do not reset it on an
+                        old drum.
+TXT
+}
+
+main() {
+  local cmd=${1:-}
+  [[ $# -gt 0 ]] && shift
+  case $cmd in
+    -h|--help|help) usage; return 0 ;;
+    "") usage >&2; return 1 ;;
+    --version) echo "printer-care $VERSION"; return 0 ;;
+  esac
+  load_config
+  case $cmd in
+    status)       cmd_status "$@" ;;
+    check)        cmd_check "$@" ;;
+    keepalive)    cmd_keepalive "$@" ;;
+    test-page)    cmd_testpage "$@" ;;
+    jobs)         cmd_jobs "$@" ;;
+    cancel-stuck) cmd_cancel_stuck "$@" ;;
+    history)      cmd_history "$@" ;;
+    care)         cmd_care "$@" ;;
+    *) warn "unknown command '$cmd'"; usage >&2; return 1 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

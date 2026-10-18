@@ -1,0 +1,26 @@
+# /etc/printer-care.conf - KEY=VALUE, one per line. Not a shell file: nothing is
+# expanded or executed, unknown keys are ignored. Environment variables of the same
+# name override this file. Install with mode 600 (it may hold a webhook URL).
+
+# --- colour ink-tank printer (counter source + keep-alive target)
+COLOUR_HOST=colour-printer.example.lan   # hostname/IP answering SNMP and IPP
+COLOUR_QUEUE=colour                      # CUPS queue name
+COLOUR_USB_ID=04f9:0767                  # vendor:product, see `lsusb`
+
+# --- mono laser printer (status only)
+BLACK_HOST=black-printer.example.lan
+BLACK_QUEUE=black
+BLACK_USB_ID=04f9:009e
+
+# --- behaviour
+SNMP_COMMUNITY=public     # SNMP v2c read community
+KEEPALIVE_DAYS=7          # print a keep-alive after this many days without colour
+LOW_INK_PERCENT=15        # `status` flags ink/toner below this
+
+# --- notifications (empty = log only)
+# Home Assistant webhook, see docs/home-assistant.md
+HA_WEBHOOK_URL=
+# HA_WEBHOOK_URL=http://homeassistant.example.lan:8123/api/webhook/printer_care
+
+# --- CUPS page log (enable PageLogFormat, see README)
+PAGE_LOG=/var/log/cups/page_log
