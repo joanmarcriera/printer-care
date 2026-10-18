@@ -1,0 +1,21 @@
+[Unit]
+Description=printer-care: update colour-page clock and print a keep-alive page if due
+After=network-online.target cups.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/printer-care check
+User=root
+# Hardening: state lives in /var/lib/printer-care; everything else is read-only.
+StateDirectory=printer-care
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# lp talks to cupsd over its unix socket; connecting works on a read-only mount,
+# but list it explicitly so a tightened ProtectSystem never breaks printing.
+ReadWritePaths=/run/cups
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

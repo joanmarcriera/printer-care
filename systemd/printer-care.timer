@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily printer-care check
+
+[Timer]
+OnCalendar=*-*-* 10:30
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target
