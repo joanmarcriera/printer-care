@@ -69,6 +69,44 @@ PageLogFormat %p %u %j %T %P %C %{job-originating-host-name} %{print-color-mode}
 ```
 then `sudo systemctl restart cups`. (CUPS 2.x default is empty = no page log.) `job-name`
 is last because it may contain spaces. Per-page and `total` lines are both handled.
+Debian's stock `/etc/logrotate.d/cups-daemon` rotates `/var/log/cups/*log` daily and keeps 7,
+which silently deletes `page_log` history after a week. Narrow that glob to
+`access_log error_log` and give `page_log` its own stanza (e.g. monthly, `rotate 24`, `copytruncate`).
+
+### USB gotcha: Brother inkjets want IPP-over-USB, not the raw USB channel
+
+The DCP-T780DW advertises `CMD:HBP,PJL,URF` in its USB device ID, so a driverless queue on
+`usb://Brother/...` looks right, and CUPS reports every job as *completed*. Nothing prints.
+Tested on 2026-10-18: the same Apple-raster (URF) file prints over the network via IPP, but on
+the raw USB printer channel (interface class 7/1/2) the printer swallows it silently, whether
+bare or wrapped in `@PJL ENTER LANGUAGE=URF`.
+
+What works is the printer's **IPP-over-USB** interface (7/1/4) through
+[`ipp-usb`](https://github.com/OpenPrinting/ipp-usb):
+
+```ini
+# /etc/ipp-usb/quirks/local.conf: keep other USB printers on the classic usb:// backend
+[Brother HL-L2350DW*]
+  blacklist = true
+```
+
+In `/etc/ipp-usb/ipp-usb.conf` set `dns-sd = disable` so the printer isn't advertised twice
+(CUPS already shares the queue), then:
+
+```sh
+sudo systemctl unmask ipp-usb && sudo systemctl start ipp-usb
+sudo lpadmin -p colour -v ipp://localhost:60000/ipp/print
+```
+
+Two traps:
+
+- Without the blacklist, `ipp-usb` also claims any other IPP-USB-capable printer (the HL-L2350DW
+  has a 7/1/4 interface too), and that printer's `usb://` queue hangs at "Waiting for printer".
+- `ipp-usb status` (0.9.23) can panic and take the daemon down with it. A systemd drop-in with
+  `Restart=on-failure` brings it back.
+
+The laser works fine on the raw channel with `brlaser`. `printer-care` doesn't mind which path
+a queue uses; its USB check only looks for the device with `lsusb`.
 
 ## Usage
 
@@ -139,6 +177,9 @@ Recipes (webhook automation, low-ink alerts, conditional dashboard card) are in
 - It cannot tell you the tanks are physically empty - only that a keep-alive did not register.
 - `cancel-stuck` needs GNU `date -d` (fine on Linux).
 - Not a substitute for printing real colour occasionally; it only covers gaps.
+- The colour counter can rise by more than the sheets that come out. In testing, raw-USB jobs
+  that printed nothing were still counted. It is a reliable "colour was used" signal, not a
+  sheet count.
 
 ## Development
 
