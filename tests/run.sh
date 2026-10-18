@@ -60,15 +60,35 @@ apply_counter 1 $((NOW+3*86400)); eq "counter reset re-baselines only" "$((NOW+2
 
 # --- check scenarios in an isolated state dir (subshells so globals/exit don't leak)
 SD=$TMP/sd
-run_check() {   # run_check STATEFILE_CONTENT FIXTURE [args...] -> stdout+stderr; state dir is $SD
+mkdir -p "$TMP/bin"
+# fake lp: records a job per call, prints CUPS' real reply format; fake curl: records argv + stdin
+cat > "$TMP/bin/lp" <<'EOT'
+#!/bin/sh
+cat >/dev/null; n=$(wc -l < "$LPLOG" | tr -d ' '); echo "job" >> "$LPLOG"; echo "request id is colour-$((n+1)) (1 file(s))"
+EOT
+cat > "$TMP/bin/curl" <<'EOT'
+#!/bin/sh
+echo "$@" > "$CURLARGS"; cat > "$CURLSTDIN"
+EOT
+chmod +x "$TMP/bin/lp" "$TMP/bin/curl"
+export LPLOG=$TMP/lp.log CURLARGS=$TMP/curl.args CURLSTDIN=$TMP/curl.stdin
+: > "$LPLOG"
+
+# run_again NOW FIXTURE [args] - one `check` against the CURRENT $SD (state persists between calls)
+run_again() {
+  local now=$1 fix=$2; shift 2
+  (
+    export PRINTER_CARE_CONF=/dev/null PRINTER_CARE_STATE_DIR=$SD PRINTER_CARE_NOW=$now \
+           PRINTER_CARE_SNMP_FIXTURE=$fix PRINTER_CARE_USB=yes COLOUR_HOST=colour-printer.example.lan \
+           PRINTER_CARE_LPSTAT_O=${LPQ:-/dev/null} PATH="$TMP/bin:$PATH"
+    main check "$@"
+  ) 2>&1
+}
+run_check() {   # run_check STATEFILE_CONTENT FIXTURE [args...] -> fresh state dir $SD, then one run at $NOW
   local content=$1 fix=$2; shift 2
   rm -rf "$SD"; mkdir -p "$SD"
   [[ -z $content ]] || printf '%s\n' "$content" > "$SD/state"
-  (
-    export PRINTER_CARE_CONF=/dev/null PRINTER_CARE_STATE_DIR=$SD PRINTER_CARE_NOW=$NOW \
-           PRINTER_CARE_SNMP_FIXTURE=$fix PRINTER_CARE_USB=yes COLOUR_HOST=colour-printer.example.lan
-    main check "$@"
-  ) 2>&1
+  run_again "$NOW" "$fix" "$@"
 }
 sget() { sed -n "s/^$1=//p" "$SD/state"; }
 
@@ -90,7 +110,7 @@ out=$(run_check "COLOUR_COUNT=3
 COLOUR_CHANGED_AT=$((NOW-8*86400))" "$FX/counters.snmp" --dry-run); has "dry-run no webhook" "dry-run" "$out"
 
 out=$( rm -rf "$SD"; mkdir -p "$SD"; printf 'COLOUR_COUNT=3\nCOLOUR_CHANGED_AT=%s\n' $((NOW-8*86400)) > "$SD/state"
-  export PRINTER_CARE_CONF=/dev/null PRINTER_CARE_STATE_DIR=$SD PRINTER_CARE_NOW=$NOW PRINTER_CARE_SNMP_FIXTURE=$FX/counters.snmp PRINTER_CARE_USB=no
+  export PRINTER_CARE_CONF=/dev/null PRINTER_CARE_STATE_DIR=$SD PRINTER_CARE_NOW=$NOW PRINTER_CARE_SNMP_FIXTURE=$FX/counters.snmp PRINTER_CARE_USB=no PRINTER_CARE_LPSTAT_O=/dev/null
   main check --dry-run 2>&1 ); rc=$?
 has "USB absent -> printer_absent" "printer_absent" "$out"; eq "USB absent rc" 3 "$rc"
 
@@ -163,6 +183,94 @@ eq "json_escape quotes" 'say \"hi\" \\ x\ny' "$(json_escape $'say "hi" \\ x\ny')
 ps=$(gen_ps colour "title (x)" "line \\ two")
 has "ps escapes parens" 'title \(x\)' "$ps"; has "ps has cyan bar" "0 1 1 setrgbcolor 80 740 400 6 rectfill" "$ps"; has "ps ends" "showpage" "$ps"
 hasnt "mono ps has no colour" "setrgbcolor" "$(gen_ps mono t s)"
+
+# ======================= fix-round tests =======================
+LOW_INK_PERCENT=15
+lines() { wc -l < "$LPLOG" | tr -d ' '; }
+
+# --- 1. injection through every untrusted-data boundary
+PW=$TMP/pwned-arith
+printf '    marker-levels (1setOf integer) = a[$(touch %s)],5\n    marker-names (1setOf nameWithoutLanguage) = M$(id),BK\n' "$PW" > "$TMP/evil.ipp"
+mk=$(markers_parse < "$TMP/evil.ipp")
+eq "markers_parse sanitises" "Mid -1
+BK 5" "$mk"
+printf '%s\n' "$mk" | fmt_markers >/dev/null; [[ ! -e $PW ]] && ok || bad "IPP level not executed" "no file" "created"
+printf 'a[$(touch %s)] M 5\n' "$PW" | fmt_markers >/dev/null; [[ ! -e $PW ]] && ok || bad "fmt_markers guards" "no file" "created"
+pct_ceil "a[\$(touch $PW)]" 100 >/dev/null; [[ ! -e $PW ]] && ok || bad "pct_ceil guards" "no file" "created"
+eq "norm_hex drops non-byte tokens" "00 01 FF" "$(norm_hex "00 a[\$(touch $PW)] 01 zz FF")"
+decode_tlv "00 01 04 a[\$(touch $PW)] 00 00 05 FF" 00 >/dev/null; [[ ! -e $PW ]] && ok || bad "hex tokens guarded" "no file" "created"
+decode_tlv "00 01 04 00 00 00 05 FF" "a[\$(touch $PW)]" >/dev/null; [[ ! -e $PW ]] && ok || bad "tlv code arg guarded" "no file" "created"
+out=$(run_check "COLOUR_COUNT=a[\$(touch $PW)]
+COLOUR_CHANGED_AT=$((NOW-86400))
+LAST_KEEPALIVE_AT=\$(touch $PW)" "$FX/counters.snmp"); [[ ! -e $PW ]] && ok || bad "state COLOUR_COUNT injection" "no file" "created"
+eq "bad state value reset" 3 "$(sget COLOUR_COUNT)"
+eq "days_between rejects junk" 0 "$(days_between 'a[$(false)]' 5)"
+
+# --- 2. shipped example conf loads, inline comments stripped
+out=$( unset COLOUR_HOST COLOUR_QUEUE BLACK_HOST KEEPALIVE_DAYS LOW_INK_PERCENT HA_WEBHOOK_URL SNMP_COMMUNITY COLOUR_USB_ID
+  PRINTER_CARE_CONF=$HERE/../printer-care.conf.example load_config
+  echo "$COLOUR_HOST|$KEEPALIVE_DAYS|$LOW_INK_PERCENT|$SNMP_COMMUNITY|$COLOUR_USB_ID|[$HA_WEBHOOK_URL]" )
+eq "example conf parses" "colour-printer.example.lan|7|15|public|04f9:0767|[]" "$out"
+printf 'KEEPALIVE_DAYS=3   # three\nHA_WEBHOOK_URL="http://h/x#frag y"  # c\nBLACK_QUEUE=a#b\nBLACK_HOST=\x27q h\x27\n' > "$TMP/cm.conf"
+out=$( unset KEEPALIVE_DAYS HA_WEBHOOK_URL BLACK_QUEUE BLACK_HOST; PRINTER_CARE_CONF=$TMP/cm.conf load_config; echo "$KEEPALIVE_DAYS|$HA_WEBHOOK_URL|$BLACK_QUEUE|$BLACK_HOST" )
+eq "inline comments / quotes" "3|http://h/x#frag y|a#b|q h" "$out"
+out=$( rm -rf "$SD"; mkdir -p "$SD"; printf 'COLOUR_COUNT=3\nCOLOUR_CHANGED_AT=%s\n' $((NOW-8*86400)) > "$SD/state"
+  unset COLOUR_HOST KEEPALIVE_DAYS
+  PRINTER_CARE_CONF=$HERE/../printer-care.conf.example PRINTER_CARE_STATE_DIR=$SD PRINTER_CARE_NOW=$NOW PRINTER_CARE_SNMP_FIXTURE=$FX/counters.snmp \
+    PRINTER_CARE_USB=yes PRINTER_CARE_LPSTAT_O=/dev/null main check --dry-run 2>&1 ); rc=$?
+has "example conf reaches decision" "would print keep-alive" "$out"; eq "example conf rc" 0 "$rc"
+
+# --- 3. no paper-waste loop
+BASE=$NOW
+: > "$LPLOG"; rm -rf "$SD"; mkdir -p "$SD"
+for d in 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14; do
+  run_again $((BASE + d*86400)) "$TMP/bad.snmp" >/dev/null
+  [[ $d == 6 ]] && eq "SNMP down: no print before day 7" 0 "$(lines)"
+  [[ $d == 13 ]] && eq "SNMP down: exactly 1 print in days 7-13" 1 "$(lines)"
+  [[ $d == 13 ]] && eq "job cleared though count unknown" "" "$(sget LAST_KEEPALIVE_JOB)"
+  [[ $d == 14 ]] && eq "SNMP down: 2nd print on day 14" 2 "$(lines)"
+done
+eq "SNMP down: miss counter" 15 "$(sget SNMP_MISSES)"
+eq "keep-alive time kept" "$((BASE+14*86400))" "$(sget LAST_KEEPALIVE_AT)"
+
+: > "$LPLOG"
+out=$(run_check "COLOUR_COUNT=3
+COLOUR_CHANGED_AT=$((NOW-8*86400))" "$FX/counters.snmp"); eq "due run prints once" 1 "$(lines)"
+eq "fresh baseline stored" 3 "$(sget COUNT_AT_KEEPALIVE)"; eq "job recorded" colour-1 "$(sget LAST_KEEPALIVE_JOB)"
+out=$(run_again $((NOW+86400)) "$FX/counters.snmp")   # job cancelled (not in queue), counter flat
+has "cancelled+flat -> not counted" keepalive_not_counted "$out"; eq "no reprint next day" 1 "$(lines)"
+out=$(run_again $((NOW+2*86400)) "$FX/counters.snmp"); eq "still no reprint day 2" 1 "$(lines)"
+
+: > "$LPLOG"; LPQ=fail out=$(LPQ=fail run_check "COLOUR_COUNT=3
+COLOUR_CHANGED_AT=$((NOW-20*86400))" "$FX/counters.snmp"); rc=$?
+eq "lpstat failing -> no print" 0 "$(lines)"; has "lpstat failure logged" "lpstat failed" "$out"; eq "lpstat failure rc" 0 "$rc"
+printf 'colour-1  marc  1024  Sun 18 Oct 2026 10:30:42 AM BST\n' > "$TMP/lpq.pending"
+out=$(LPQ=$TMP/lpq.pending run_check "COLOUR_COUNT=3
+COLOUR_CHANGED_AT=$((NOW-20*86400))
+LAST_KEEPALIVE_AT=$((NOW-8*86400))
+LAST_KEEPALIVE_JOB=colour-1
+COUNT_AT_KEEPALIVE=3" "$FX/counters.snmp"); rc=$?
+has "queued past window -> stuck" keepalive_stuck "$out"; eq "stuck rc" 3 "$rc"; eq "stuck no print" 0 "$(lines)"
+
+# counter_unreadable cadence: 3rd, then every 7th (10th)
+for m in 2 3 5 9 10 16 17; do
+  out=$(run_check "SNMP_MISSES=$((m-1))
+COLOUR_CHANGED_AT=$((NOW-86400))" "$TMP/bad.snmp")
+  case $m in 3|10|17) has "miss #$m notifies" counter_unreadable "$out" ;; *) hasnt "miss #$m silent" counter_unreadable "$out" ;; esac
+done
+
+# --- 4. colour counter must exist
+printf '00 01 04 00 00 00 05 FF\n' > "$TMP/nocolour.hex"
+( PRINTER_CARE_SNMP_FIXTURE=$TMP/nocolour.hex read_counters x >/dev/null ); eq "read_counters needs code 02" 1 $?
+: > "$LPLOG"
+out=$(run_check "COLOUR_COUNT=3
+COLOUR_CHANGED_AT=$((NOW-8*86400))" "$TMP/bad.snmp"); eq "unreadable baseline left empty" "" "$(sget COUNT_AT_KEEPALIVE)"
+
+# --- 6. webhook URL stays off argv
+: > "$CURLARGS"; : > "$CURLSTDIN"
+( HA_WEBHOOK_URL='http://ha.example.lan/api/webhook/SECRETID' PATH="$TMP/bin:$PATH"; DRY=0; notify test 'm "q"' colour >/dev/null )
+hasnt "URL not in curl argv" SECRETID "$(cat "$CURLARGS")"; has "URL passed on stdin" 'url = "http://ha.example.lan/api/webhook/SECRETID"' "$(cat "$CURLSTDIN")"
+has "payload in argv" '"event":"test"' "$(cat "$CURLARGS")"
 
 # --- CLI surface
 out=$(main --help); has "help is the header" "Exit codes:" "$out"
