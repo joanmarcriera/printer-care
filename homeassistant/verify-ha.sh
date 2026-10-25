@@ -4,7 +4,7 @@
 #   default : GET /api/states; PASS if >=5 brother supply sensors have a numeric state and both
 #             automations (printers_supplies_low, printers_printer_care_events) exist.
 #   --fire  : ALSO POST one test event to the webhook (sends a real phone notification; only on request).
-#             Needs HA_WEBHOOK_ID (default printer_care).
+#             Needs HA_WEBHOOK_ID (no default: it is a secret).
 # Exit: 0 all PASS, 1 any FAIL, 2 usage/config. The token is never printed.
 set -uo pipefail
 : "${HA_URL:?set HA_URL}" "${HA_TOKEN:?set HA_TOKEN}"
@@ -33,7 +33,7 @@ done
 if [[ ${1:-} == --fire ]]; then
   code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -X POST -H 'Content-Type: application/json' \
     -d '{"event":"test","printer":"verify-ha","message":"verify-ha.sh test event"}' \
-    "${HA_URL%/}/api/webhook/${HA_WEBHOOK_ID:-printer_care}")
+    "${HA_URL%/}/api/webhook/${HA_WEBHOOK_ID:?set HA_WEBHOOK_ID for --fire}")
   if [[ $code == 200 ]]; then pass "webhook POST -> 200 (confirm the phone notification)"; else fail "webhook POST -> $code"; fi
 fi
 echo "--- $fails failure(s)"

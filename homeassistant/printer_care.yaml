@@ -4,8 +4,11 @@
 # printers (hostnames black.lab.riera.co.uk type laser, colour.lab.riera.co.uk type ink).
 # Replace the SENSOR_* entity ids with the real ones (Developer tools > States, filter "brother"), and
 # notify.mobile_app_PHONE with your phone's notify service. Needs HA >= 2024.10 syntax.
+# The webhook id IS the credential: generate it with 'openssl rand -hex 32', put it in HA's secrets.yaml as
+# printer_care_webhook_id: <value>, never commit it. (The live 2026-10-18 webhook still uses the guessable
+# id "printer_care": rotate it, see https://familia.riera.co.uk/tasks/3704.)
 # Webhook is local_only: never expose it publicly. HA_WEBHOOK_URL in /etc/printer-care.conf on the Pi
-# is http://<ha-host>:8123/api/webhook/printer_care  (secret-ish: keep out of git).
+# is http://<ha-host>:8123/api/webhook/<the secret id>  (keep out of git).
 
 automation:
   - id: printers_printer_care_events
@@ -13,14 +16,14 @@ automation:
     description: Forward printer-care events (keep-alive printed/stuck, counter unreadable) to the phone
     triggers:
       - trigger: webhook
-        webhook_id: printer_care
+        webhook_id: !secret printer_care_webhook_id
         allowed_methods: [POST]
         local_only: true
     actions:
       - action: notify.mobile_app_PHONE
         data:
-          title: "Printer care: {{ trigger.json.event }} ({{ trigger.json.printer }})"
-          message: "{{ trigger.json.message }}"
+          title: "Printer care: {{ trigger.json.event | string | truncate(40) }} ({{ trigger.json.printer | string | truncate(40) }})"
+          message: "{{ trigger.json.message | string | truncate(300) }}"
     mode: queued
 
   - id: printers_supplies_low

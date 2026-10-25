@@ -17,14 +17,14 @@ hostname (e.g. `colour-printer.example.lan`) and the printer type (`laser` for t
 ## 2. printer-care webhook -> phone notification
 
 Set in `/etc/printer-care.conf`:
-`HA_WEBHOOK_URL=http://homeassistant.example.lan:8123/api/webhook/printer_care`
+`HA_WEBHOOK_URL=http://homeassistant.example.lan:8123/api/webhook/<long random id>`
 
 ```yaml
 alias: Printer care event
 description: Forward printer-care events to the phone
 triggers:
   - trigger: webhook
-    webhook_id: printer_care
+    webhook_id: <long random id>
     allowed_methods: [POST]
     local_only: true
 actions:

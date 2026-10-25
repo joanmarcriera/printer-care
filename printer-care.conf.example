@@ -20,7 +20,7 @@ LOW_INK_PERCENT=15        # `status` flags ink/toner below this
 # --- notifications (empty = log only)
 # Home Assistant webhook, see docs/home-assistant.md
 HA_WEBHOOK_URL=
-# HA_WEBHOOK_URL=http://homeassistant.example.lan:8123/api/webhook/printer_care
+# HA_WEBHOOK_URL=http://homeassistant.example.lan:8123/api/webhook/<long random id>
 
 # --- CUPS page log (enable PageLogFormat, see README)
 PAGE_LOG=/var/log/cups/page_log
