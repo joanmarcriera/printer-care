@@ -1,0 +1,20 @@
+# Wallboard card: shown only while a supply is below 15 % (task https://familia.riera.co.uk/tasks/3704).
+# Replace SENSOR_* with the real entity ids. Template-checked in the HA UI on 2026-10-18 (per the task comment).
+type: conditional
+conditions:
+  - condition: or
+    conditions:
+      - {condition: numeric_state, entity: sensor.SENSOR_colour_black_ink, below: 15}
+      - {condition: numeric_state, entity: sensor.SENSOR_colour_cyan_ink, below: 15}
+      - {condition: numeric_state, entity: sensor.SENSOR_colour_magenta_ink, below: 15}
+      - {condition: numeric_state, entity: sensor.SENSOR_colour_yellow_ink, below: 15}
+      - {condition: numeric_state, entity: sensor.SENSOR_black_toner_remaining, below: 15}
+card:
+  type: entities
+  title: Ink low
+  entities:
+    - sensor.SENSOR_colour_black_ink
+    - sensor.SENSOR_colour_cyan_ink
+    - sensor.SENSOR_colour_magenta_ink
+    - sensor.SENSOR_colour_yellow_ink
+    - sensor.SENSOR_black_toner_remaining

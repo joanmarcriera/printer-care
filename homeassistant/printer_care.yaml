@@ -1,0 +1,42 @@
+# Home Assistant package for printer-care (task https://familia.riera.co.uk/tasks/3704).
+# Drop into <config>/packages/printer_care.yaml (needs `homeassistant: packages: !include_dir_named packages`),
+# or paste the automations in the UI. Prerequisite: the core "Brother Printer" integration added for both
+# printers (hostnames black.lab.riera.co.uk type laser, colour.lab.riera.co.uk type ink).
+# Replace the SENSOR_* entity ids with the real ones (Developer tools > States, filter "brother"), and
+# notify.mobile_app_PHONE with your phone's notify service. Needs HA >= 2024.10 syntax.
+# Webhook is local_only: never expose it publicly. HA_WEBHOOK_URL in /etc/printer-care.conf on the Pi
+# is http://<ha-host>:8123/api/webhook/printer_care  (secret-ish: keep out of git).
+
+automation:
+  - id: printers_printer_care_events
+    alias: Printer care event
+    description: Forward printer-care events (keep-alive printed/stuck, counter unreadable) to the phone
+    triggers:
+      - trigger: webhook
+        webhook_id: printer_care
+        allowed_methods: [POST]
+        local_only: true
+    actions:
+      - action: notify.mobile_app_PHONE
+        data:
+          title: "Printer care: {{ trigger.json.event }} ({{ trigger.json.printer }})"
+          message: "{{ trigger.json.message }}"
+    mode: queued
+
+  - id: printers_supplies_low
+    alias: Printer ink or toner low
+    triggers:
+      - trigger: numeric_state
+        entity_id:
+          - sensor.SENSOR_colour_black_ink
+          - sensor.SENSOR_colour_cyan_ink
+          - sensor.SENSOR_colour_magenta_ink
+          - sensor.SENSOR_colour_yellow_ink
+          - sensor.SENSOR_black_toner_remaining
+        below: 15
+    actions:
+      - action: notify.mobile_app_PHONE
+        data:
+          title: "Printer supply low"
+          message: "{{ trigger.to_state.name }} is at {{ trigger.to_state.state }}%"
+    mode: queued

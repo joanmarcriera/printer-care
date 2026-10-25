@@ -1,5 +1,7 @@
 # Home Assistant integration
 
+Ready-to-paste versions: `homeassistant/` (package, wallboard card, `verify-ha.sh`).
+
 Two independent pieces: HA's core **Brother** integration reads ink/toner natively;
 **printer-care** pushes its own events (keep-alive printed/stuck, counter unreadable...) to a webhook.
 
