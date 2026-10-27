@@ -127,8 +127,8 @@ load_config() {
   STATE_DIR=${PRINTER_CARE_STATE_DIR:-/var/lib/printer-care}
   STATE_FILE=$STATE_DIR/state
   parse_kv "$CONF_FILE" "$CONF_KEYS" 1
-  : "${COLOUR_HOST:=}" "${COLOUR_QUEUE:=colour}" "${COLOUR_USB_ID:=04f9:0767}"
-  : "${BLACK_HOST:=}" "${BLACK_QUEUE:=black}" "${BLACK_USB_ID:=04f9:009e}"
+  : "${COLOUR_HOST:=}" "${COLOUR_QUEUE:=colour}" "${COLOUR_USB_ID=04f9:0767}"   # '=' not ':=': an explicit empty id means "no USB check"
+  : "${BLACK_HOST:=}" "${BLACK_QUEUE:=black}" "${BLACK_USB_ID=04f9:009e}"
   : "${SNMP_COMMUNITY:=public}" "${KEEPALIVE_DAYS:=7}" "${LOW_INK_PERCENT:=15}"
   : "${HA_WEBHOOK_URL:=}" "${PAGE_LOG:=/var/log/cups/page_log}"
   [[ $KEEPALIVE_DAYS =~ ^[0-9]+$ && $KEEPALIVE_DAYS -ge 1 ]] || die 1 "KEEPALIVE_DAYS must be a positive integer (got '$KEEPALIVE_DAYS')"
@@ -288,6 +288,7 @@ ipp_markers() {
 # ---------------------------------------------------------------- CUPS / USB helpers
 usb_present() {   # yes | no | unknown (no lsusb, e.g. macOS); PRINTER_CARE_USB overrides (tests)
   [[ -z ${PRINTER_CARE_USB:-} ]] || { echo "$PRINTER_CARE_USB"; return 0; }
+  [[ -n ${1:-} ]] || { echo unknown; return 0; }   # empty USB id = printer is on the network, no USB check
   have lsusb || { echo unknown; return 0; }
   if lsusb -d "$1" >/dev/null 2>&1; then echo yes; else echo no; fi
 }

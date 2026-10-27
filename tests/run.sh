@@ -30,6 +30,7 @@ eq "tlv duplex" 0 "$(decode_tlv "$HEX" 06)"
 decode_tlv "$HEX" 55 >/dev/null; eq "tlv missing code -> rc 1" 1 $?
 eq "tlv mono printer total" 7592 "$(decode_tlv "$(cat "$FX/mono-counters.hex")" 00)"
 eq "tlv 4-byte value" 3231 "$(decode_tlv "$(cat "$FX/mono-counters.hex")" 06)"
+eq "usb_present empty id -> unknown (network-only host)" unknown "$(usb_present "")"
 MAINT=$(norm_hex "$(cat "$FX/maint.snmp")")
 eq "maint 0x81" 99 "$(decode_tlv "$MAINT" 81)"
 eq "maint 0x6F" 9900 "$(decode_tlv "$MAINT" 6F)"

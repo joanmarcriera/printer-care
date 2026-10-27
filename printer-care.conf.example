@@ -5,7 +5,7 @@
 # --- colour ink-tank printer (counter source + keep-alive target)
 COLOUR_HOST=colour-printer.example.lan   # hostname/IP answering SNMP and IPP
 COLOUR_QUEUE=colour                      # CUPS queue name
-COLOUR_USB_ID=04f9:0767                  # vendor:product, see `lsusb`
+COLOUR_USB_ID=04f9:0767                  # vendor:product, see `lsusb`; empty = printer on the network, skip the USB check
 
 # --- mono laser printer (status only)
 BLACK_HOST=black-printer.example.lan
