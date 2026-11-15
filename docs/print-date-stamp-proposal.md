@@ -12,8 +12,8 @@ PDF and images go straight to `lp`; `--mono` hands plain text to the CUPS text f
 - `scripts/stamp.py` (new): stamps `YYYY-MM-DD` in 8 pt Helvetica, 14 mm from the right and 7 mm from the top, on every page
   (pypdf + reportlab, both installed for the system `python3`).
 - `print.sh`: every path now ends in a PDF that is stamped before `lp`. Markdown/text: stamp the weasyprint PDF. PDF input: stamp a
-  copy (the original is untouched). Images: converted to an A4 PDF (fit, centred, 90 %) first. `--mono`: `cupsfilter` renders the same
-  text (cpi and lpi kept) to PDF, then stamped. `--no-stamp` opts out. If stamping fails nothing is printed (exit 3, message says
+  copy (the original is untouched). Images: first frame converted to an A4 PDF (aspect kept, never cropped, at most 90 % of the page, centred) first.
+  `--mono`: `cupsfilter` renders the same text (`media=A4`, cpi and lpi kept) to PDF, then stamped; a cupsfilter failure exits 3. `--no-stamp` opts out. If stamping fails nothing is printed (exit 3, message says
   `--no-stamp` skips it) so a job never silently loses the date.
 
 ## Verified (scratch copy, `--dry-run`, nothing printed)
@@ -21,6 +21,9 @@ PDF and images go straight to `lp`; `--mono` hands plain text to the CUPS text f
 - A first version failed on pypdf 7 (`replace_contents` removed); the failure path refused to print, then the fix passed.
 - `git apply --check` in claude-config: rc=0.
 - Visual check of the md page: date sits top-right, clear of the 12 mm text margin.
+- Sonnet review round 1 (VERDICT: FIX) found: image path cropped/shrunk (now fits, checked with a 4000x3000 gradient: whole image
+  visible, A4 1 page), mono page came out Letter (now A4, 595x842), stamp ignored /Rotate and a non-zero MediaBox origin (now handled,
+  checked on a rotated page with an offset box), cupsfilter failure was silent (now exit 3).
 
 ## Apply (one command, from claude-config on a branch)
 ```sh

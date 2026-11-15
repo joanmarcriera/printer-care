@@ -10,7 +10,7 @@ Colour printer (ink tank) and black printer (laser). A weekly keep-alive page al
 | 4 | Anyone | **Dust** | Switch off with the power button only, never at the wall (the head must park and cap). Wipe the outside and paper tray with a dry cloth. Nothing sprayed on or inside. | [ ] |
 | 5 | Anyone | **Paper** | Plain A4 in the paper tray of each printer, stack flat, below the limit mark, fresh pack stored flat and closed. Photo paper stays in its bag. | [ ] |
 | 6 | Marc | **Mono toner** | `printer-care status` shows toner and drum. Swap only when the panel says Replace or print goes pale. | [ ] |
-| 7 | Marc | **Anything odd** | `printer-care jobs` shows stuck jobs; `printer-care cancel-stuck` clears jobs older than an hour after asking y/N. Wrong or missing colour, error lights, noises: write it on the back of this card for Marc. | [ ] |
+| 7 | Anyone | **Anything odd** | `printer-care jobs` shows stuck jobs; `printer-care cancel-stuck` clears jobs older than an hour after asking y/N. Wrong or missing colour, error lights, noises: write it on the back of this card for Marc. | [ ] |
 
 ## What to check or buy
 | Printer | Item | Check |

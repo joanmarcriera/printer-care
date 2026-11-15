@@ -23,7 +23,8 @@ Thresholds: success >= 99.9 %, longest outage <= 300 s, ICMP RTT p95 <= 50 ms co
 criteria" in docs/soak-week1-2026-10-28.md and docs/soak-week2-2026-10-31.md. The 28-day minimum is
 the task wording "4+ weeks" (https://familia.riera.co.uk/tasks/3711), start 2026-10-21 = week-1 window.
 Edit THRESHOLDS to recalibrate, deliberately. GO needs every check PASS, soak age >= min-days AND the
-data window itself covering >= min-days (so a 7-day look can never say GO, and an early bad week
+data window itself covering >= min-days, and each Wi-Fi target's own series spanning it with >= 95 % of
+the expected samples and reaching the window end (so a 7-day look can never say GO, and an early bad week
 cannot be forgotten: use --days 28 or merge the saved weekly bundles).
 The wired Pi is a control: shown, never judged. The weekly F4 test print is a manual line.
 """
@@ -108,7 +109,10 @@ def target_data_ok(bundle, name, min_days, tolerance=0.95):
         pts = bundle["series"].get(kind, {}).get(name, [])
         if not pts or pts[0][0] > end - (min_days - 0.5) * 86400:
             return False
-        if len(pts) < tolerance * (end - pts[0][0]) / STEPS[kind]:
+        if end - pts[-1][0] > 3 * STEPS[kind] + 60:      # series stopped before the end of the window
+            return False
+        buckets = len(set(int(t // STEPS[kind]) for t, _ in pts))   # duplicates cannot mask a hole
+        if buckets < tolerance * (end - pts[0][0]) / STEPS[kind]:
             return False
     return True
 

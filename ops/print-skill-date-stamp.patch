@@ -1,5 +1,5 @@
 diff --git a/scripts/print.sh b/scripts/print.sh
-index c6e0784..e679b78 100755
+index c6e0784..3e88318 100755
 --- a/scripts/print.sh
 +++ b/scripts/print.sh
 @@ -18,6 +18,7 @@
@@ -43,13 +43,14 @@ index c6e0784..e679b78 100755
  submit() {  # submit <file> — print or report dry-run
    if [[ -n "$DRYRUN" ]]; then echo "dry-run: $1 (lp ${LP_OPTS[*]})"; return; fi
    lp "${LP_OPTS[@]}" "$1"
-@@ -84,11 +93,23 @@ ext="${INPUT##*.}"; ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
+@@ -84,11 +93,26 @@ ext="${INPUT##*.}"; ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
  # Raw monospace path: plain text straight to CUPS text filter with cpi sizing.
  if [[ -n "$MONO" ]]; then
    LP_OPTS+=(-o "cpi=$MONO_CPI" -o lpi=8)
 +  if [[ -n "$STAMP" ]]; then   # same text rendering as a PDF (cpi/lpi kept), then stamp it
 +    mono_pdf="$TMPD/mono.pdf"
-+    cupsfilter -m application/pdf -o "cpi=$MONO_CPI" -o lpi=8 "$INPUT" > "$mono_pdf" 2>/dev/null
++    cupsfilter -m application/pdf -o media=A4 -o "cpi=$MONO_CPI" -o lpi=8 "$INPUT" > "$mono_pdf" 2>/dev/null \
++      || { echo "error: cupsfilter failed, nothing printed (use --no-stamp for the raw text path)" >&2; exit 3; }
 +    stamp "$mono_pdf"; submit "$mono_pdf"; exit 0
 +  fi
    submit "$INPUT"; exit 0
@@ -62,13 +63,15 @@ index c6e0784..e679b78 100755
 +    submit "$INPUT" ;;
 +  png|jpg|jpeg|tiff|gif)
 +    if [[ -n "$STAMP" ]]; then   # image becomes an A4 PDF (fit, centred) so it can carry the stamp
-+      magick "$INPUT" -resize 90% -gravity center -background white -extent 2480x3508 -units PixelsPerInch -density 300 "$TMPD/img.pdf"
++      # first frame only; fit inside 90 % of an A4 page at 300 dpi (keeps aspect, never crops), then centre on white A4
++      magick "$INPUT[0]" -auto-orient -resize 2232x3157 -gravity center -background white -alpha remove -extent 2480x3508 \
++        -units PixelsPerInch -density 300 "$TMPD/img.pdf"
 +      stamp "$TMPD/img.pdf"; INPUT="$TMPD/img.pdf"
 +    fi
      submit "$INPUT" ;;
    md|markdown|txt|text|log|*)
      # Markdown (and plain text, which GFM renders fine) → HTML → weasyprint PDF.
-@@ -104,5 +125,6 @@ case "$ext" in
+@@ -104,5 +128,6 @@ case "$ext" in
      cat "$body" >> "$page"
      printf '</body></html>\n' >> "$page"
      weasyprint -s "$CSS" "$page" "$pdf" 2>/dev/null
@@ -77,10 +80,10 @@ index c6e0784..e679b78 100755
  esac
 diff --git a/scripts/stamp.py b/scripts/stamp.py
 new file mode 100755
-index 0000000..34a8530
+index 0000000..9e878fe
 --- /dev/null
 +++ b/scripts/stamp.py
-@@ -0,0 +1,44 @@
+@@ -0,0 +1,46 @@
 +#!/usr/bin/env python3
 +"""stamp.py - stamp the print date in the top-right corner of every page of a PDF.
 +
@@ -105,16 +108,18 @@ index 0000000..34a8530
 +    try:
 +        reader = PdfReader(src)
 +        writer = PdfWriter()
-+        for page in reader.pages:
++        for src_page in reader.pages:
++            page = writer.add_page(src_page)          # attach first (pypdf >= 7), then edit
++            page.transfer_rotation_to_content()       # a /Rotate page would put the stamp on the wrong edge
++            x0, y0 = float(page.mediabox.left), float(page.mediabox.bottom)
 +            w, h = float(page.mediabox.width), float(page.mediabox.height)
 +            buf = io.BytesIO()
-+            c = canvas.Canvas(buf, pagesize=(w, h))
++            c = canvas.Canvas(buf, pagesize=(x0 + w, y0 + h))
 +            c.setFont("Helvetica", 8)
-+            c.drawRightString(w - 14 * 2.835, h - 7 * 2.835, text)   # 14 mm from right, 7 mm from top
++            c.drawRightString(x0 + w - 14 * 2.835, y0 + h - 7 * 2.835, text)   # 14 mm from right, 7 mm from top
 +            c.save()
 +            buf.seek(0)
-+            attached = writer.add_page(page)          # attach first (pypdf >= 7), then merge
-+            attached.merge_page(PdfReader(buf).pages[0])
++            page.merge_page(PdfReader(buf).pages[0])
 +        with open(dst, "wb") as f:
 +            writer.write(f)
 +    except Exception as e:  # unreadable or encrypted PDF

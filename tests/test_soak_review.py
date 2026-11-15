@@ -126,6 +126,24 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(r["rows"]["colour"]["verdict"], "KEEP SOAKING")
         self.assertNotEqual(r["overall"], "GO")
 
+    def test_series_that_stopped_a_day_before_the_end_is_not_go(self):
+        b = bundle()
+        for kind in ("icmp", "ipp", "rtt"):
+            b["series"][kind]["black"] = [p for p in b["series"][kind]["black"] if p[0] < END - 86400]
+        self.assertNotEqual(ev(b)["rows"]["black"]["verdict"], "GO")
+
+    def test_overlapping_bundles_do_not_double_count_over_a_hole(self):
+        # two 28 d saves 14 d apart with a different sample phase: duplicates must not mask a 5 d hole
+        a = bundle(end=END)
+        late = bundle(end=END - 14 * 86400 + 7)
+        hole = (END - 25 * 86400, END - 20 * 86400)
+        for bb in (a, late):
+            for kind in ("icmp", "ipp", "rtt"):
+                bb["series"][kind]["black"] = [p for p in bb["series"][kind]["black"] if not hole[0] <= p[0] < hole[1]]
+        m = soak.merge_bundles([a, late])
+        m["end"] = END
+        self.assertNotEqual(ev(m)["rows"]["black"]["verdict"], "GO")
+
     def test_prometheus_hole_inside_the_window_is_not_a_clean_run(self):
         # 28 d span but a 10 d hole (Prometheus down): the missing days must not count as 100 % success
         b = bundle()

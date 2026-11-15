@@ -11,7 +11,14 @@ BIN  := /usr/local/bin/printer-care
 CONF := /etc/printer-care.conf
 UNIT := /etc/systemd/system
 
-.PHONY: test lint install uninstall
+.PHONY: test lint install uninstall card-pdf
+
+# Re-render the family chore card (needs pandoc + weasyprint); prints the page count, which must be 1.
+card-pdf:
+	{ echo '<meta charset="utf-8">'; pandoc -f gfm -t html docs/monthly-printer-card.md; } > docs/.card.html
+	weasyprint -s docs/monthly-printer-card.css docs/.card.html docs/monthly-printer-card.pdf
+	rm -f docs/.card.html
+	pdfinfo docs/monthly-printer-card.pdf | grep Pages
 
 lint:
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck -x printer-care tests/run.sh && echo "shellcheck ok"; \
