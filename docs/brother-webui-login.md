@@ -28,10 +28,11 @@ Brother's own DCP-T780DW online guide was not found by search. The closest offic
 5. **Label from a different unit** (replaced machine, second-hand label). Compare the serial on the label with the one on the Network Configuration Report.
 
 ## Safe checklist (in order, stop when it works)
-1. On the printer panel print the **Network Configuration Report** (Settings > Network or Print Reports; menu names vary, take what the
-   panel shows). Confirm the IP and the "Pwd" line match the rear label.
+1. On the printer panel print the **Network Configuration Report** (uses one sheet and a little ink; the menu name is a guess, take what
+   the panel shows). Confirm the IP and the "Pwd" line match the rear label.
 2. In a browser, open `https://colour.lab.riera.co.uk`, one attempt with the **Network Configuration Report** password.
-3. Wait 30 minutes with no attempts if you saw a lockout message, then one more attempt.
+3. If you saw a lockout message, stop and wait (Brother says only "for a while"; 30 minutes is my guess), then one more attempt.
+   Accept the self-signed certificate warning for this one host only.
 4. Try the label password once more from a different browser or private window (rules out a saved wrong password being auto-filled).
 5. Still failing: decide whether you need the web UI at all. The cutover and soak work reads the printer over IPP and SNMP and does not need it.
 6. Only if you do need it: Marc decides on a reset, below.

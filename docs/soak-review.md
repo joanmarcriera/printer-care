@@ -1,24 +1,31 @@
 # F2 soak: the weekly review command
 
-Task <https://familia.riera.co.uk/tasks/3711>. Read-only: one GET per metric to Prometheus; starts no monitor, touches no printer.
+Task <https://familia.riera.co.uk/tasks/3711>. Read-only: GET queries to Prometheus; starts no monitor, touches no printer.
 
 ## Each week (Marc, from the Mac on the LAN)
 ```sh
-cd ~/Development/Project/printer-care && mkdir -p wifi-test/soak-bundles && wifi-test/soak-review.py --save wifi-test/soak-bundles/$(date +%F).json
+cd ~/Development/Project/printer-care && mkdir -p wifi-test/soak-bundles && wifi-test/soak-review.py --days 28 --save wifi-test/soak-bundles/$(date +%F).json
 ```
-Exit code: 0 GO, 1 KEEP SOAKING, 2 NO-GO, 3 input error. Add `--md > docs/soak-weekN-DATE.md` to keep the page in the repo.
-Re-read an old week offline: `wifi-test/soak-review.py --from wifi-test/soak-bundles/2026-11-04.json`.
+`--days 28` looks at the whole soak so far, so an early bad week is never forgotten (Prometheus retention must cover it; if the query
+returns less, the output says the data window is shorter). ICMP and RTT are fetched at the probe's own 15 s, :631 at 60 s, in chunks.
+For a quick one-week look use plain `wifi-test/soak-review.py`: it prints a "not a final verdict" note and can never say GO.
+Add `--md > docs/soak-weekN-DATE.md` to keep the page in the repo. Re-read saved weeks offline, merged:
+`wifi-test/soak-review.py --from wifi-test/soak-bundles/A.json --from wifi-test/soak-bundles/B.json`.
+
+Exit code: 0 GO | 1 KEEP SOAKING (nothing failing yet) | 2 NO-GO | 3 input error | 4 KEEP SOAKING but a check already fails.
+`--target NAME=HOST` takes the exact host in the Prometheus `instance` label; a target matching 0 or 2+ series prints a warning on stderr.
 
 ## Thresholds (per Wi-Fi printer; the wired Pi is a control, shown not judged)
-| Check | Pass |
-|---|---|
-| ICMP success | >= 99.9 % |
-| :631 success | >= 99.9 % |
-| Longest ICMP / :631 outage | <= 300 s |
-| ICMP RTT p95 | <= 50 ms |
-| Soak length | >= 28 days since 2026-10-21 (`--soak-start`, `--min-days`) |
+| Check | Pass | Source |
+|---|---|---|
+| ICMP success, :631 success | >= 99.9 % | go criteria in `docs/soak-week1-2026-10-28.md`, `docs/soak-week2-2026-10-31.md` |
+| Longest ICMP / :631 outage | <= 300 s (5 min) | same |
+| ICMP RTT p95 | <= 50 ms | same |
+| Soak length and data window | >= 28 days | task wording "4+ weeks" in <https://familia.riera.co.uk/tasks/3711>; start 2026-10-21 (`--soak-start`, `--min-days`) |
 
-GO needs every check PASS and 28 days. A FAIL before day 28 reads KEEP SOAKING; a FAIL at or after day 28 reads NO-GO; missing data is never GO.
-Weeks 1 and 2 (`docs/soak-week*.md`) suggest the RTT p95 threshold is unattainable over Wi-Fi power-save; recalibrate it in `THRESHOLDS`
-(top of the script) only as a deliberate decision, not to turn a run green. The F4 weekly test print is a manual line in the output.
-Tests: `make test` (sample logs are synthesised in `tests/test_soak_review.py`).
+GO needs every check PASS **and** a soak age and data window of 28 days. Before that, a FAIL reads KEEP SOAKING (exit 4); with a full
+window, a FAIL reads NO-GO; missing data is never GO. Outage = consecutive failed samples (each counts one probe step; a data gap does not
+bridge two outages), so it is accurate to one step.
+Weeks 1 and 2 suggest the RTT p95 threshold is unattainable over Wi-Fi power-save; recalibrate it in `THRESHOLDS` (top of the script)
+only as a deliberate decision, not to turn a run green. The F4 weekly test print is a manual line in the output.
+Tests: `make test` (22 tests, sample logs synthesised in `tests/test_soak_review.py`).

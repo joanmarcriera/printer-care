@@ -4,3 +4,5 @@
 /state/
 printer-care.conf
 *.local
+__pycache__/
+*.pyc
