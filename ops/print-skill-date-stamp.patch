@@ -1,0 +1,127 @@
+diff --git a/scripts/print.sh b/scripts/print.sh
+index c6e0784..e679b78 100755
+--- a/scripts/print.sh
++++ b/scripts/print.sh
+@@ -18,6 +18,7 @@
+ #   --landscape                   landscape orientation
+ #   --copies N                    number of copies (default 1)
+ #   --printer NAME                CUPS queue (default black = Pi HL-L2350DW; colour = DCP-T780DW)
++#   --no-stamp                    skip the corner date stamp (default: YYYY-MM-DD top-right on every page)
+ #   --dry-run                     build the PDF but do not print; echo its path
+ #   -h|--help                     this help
+ #
+@@ -37,9 +38,10 @@ QUALITY="3"           # 3=draft (toner-saver), 4=normal, 5=best
+ LANDSCAPE=""
+ COPIES=1
+ DRYRUN=""
++STAMP=1
+ INPUT=""
+ 
+-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
++usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+ 
+ while [[ $# -gt 0 ]]; do
+   case "$1" in
+@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
+     --landscape) LANDSCAPE="-o landscape"; shift ;;
+     --copies)    COPIES="$2"; shift 2 ;;
+     --printer)   PRINTER="$2"; shift 2 ;;
++    --no-stamp)  STAMP=""; shift ;;
+     --dry-run)   DRYRUN=1; shift ;;
+     -h|--help)   usage; exit 0 ;;
+     -)           INPUT="-"; shift ;;
+@@ -68,6 +71,12 @@ LP_OPTS=(-d "$PRINTER" -n "$COPIES" -o "sides=$SIDES" -o "print-quality=$QUALITY
+ TMPD="$(mktemp -d "${TMPDIR:-/tmp}/print.XXXXXX")"
+ trap '[[ -n "$DRYRUN" ]] || rm -rf "$TMPD"' EXIT
+ 
++stamp() {  # stamp <pdf>: date in the top-right corner of every page (skipped with --no-stamp)
++  [[ -n "$STAMP" ]] || return 0
++  python3 -I "$SKILL_DIR/scripts/stamp.py" "$1" "$1.stamped" && mv "$1.stamped" "$1" \
++    || { echo "error: date stamp failed, nothing printed (use --no-stamp to skip)" >&2; exit 3; }
++}
++
+ submit() {  # submit <file> — print or report dry-run
+   if [[ -n "$DRYRUN" ]]; then echo "dry-run: $1 (lp ${LP_OPTS[*]})"; return; fi
+   lp "${LP_OPTS[@]}" "$1"
+@@ -84,11 +93,23 @@ ext="${INPUT##*.}"; ext="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
+ # Raw monospace path: plain text straight to CUPS text filter with cpi sizing.
+ if [[ -n "$MONO" ]]; then
+   LP_OPTS+=(-o "cpi=$MONO_CPI" -o lpi=8)
++  if [[ -n "$STAMP" ]]; then   # same text rendering as a PDF (cpi/lpi kept), then stamp it
++    mono_pdf="$TMPD/mono.pdf"
++    cupsfilter -m application/pdf -o "cpi=$MONO_CPI" -o lpi=8 "$INPUT" > "$mono_pdf" 2>/dev/null
++    stamp "$mono_pdf"; submit "$mono_pdf"; exit 0
++  fi
+   submit "$INPUT"; exit 0
+ fi
+ 
+ case "$ext" in
+-  pdf|png|jpg|jpeg|tiff|gif)
++  pdf)
++    if [[ -n "$STAMP" ]]; then cp "$INPUT" "$TMPD/in.pdf"; stamp "$TMPD/in.pdf"; INPUT="$TMPD/in.pdf"; fi
++    submit "$INPUT" ;;
++  png|jpg|jpeg|tiff|gif)
++    if [[ -n "$STAMP" ]]; then   # image becomes an A4 PDF (fit, centred) so it can carry the stamp
++      magick "$INPUT" -resize 90% -gravity center -background white -extent 2480x3508 -units PixelsPerInch -density 300 "$TMPD/img.pdf"
++      stamp "$TMPD/img.pdf"; INPUT="$TMPD/img.pdf"
++    fi
+     submit "$INPUT" ;;
+   md|markdown|txt|text|log|*)
+     # Markdown (and plain text, which GFM renders fine) → HTML → weasyprint PDF.
+@@ -104,5 +125,6 @@ case "$ext" in
+     cat "$body" >> "$page"
+     printf '</body></html>\n' >> "$page"
+     weasyprint -s "$CSS" "$page" "$pdf" 2>/dev/null
++    stamp "$pdf"
+     submit "$pdf" ;;
+ esac
+diff --git a/scripts/stamp.py b/scripts/stamp.py
+new file mode 100755
+index 0000000..34a8530
+--- /dev/null
++++ b/scripts/stamp.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""stamp.py - stamp the print date in the top-right corner of every page of a PDF.
++
++Usage: stamp.py IN.pdf OUT.pdf [YYYY-MM-DD]     (date defaults to today, local time)
++Needs pypdf and reportlab (both installed for the system python3 on Marc's Mac).
++Exit 0 ok, 2 bad input. Never prints anything; used by print.sh.
++"""
++import datetime as dt
++import io
++import sys
++
++from pypdf import PdfReader, PdfWriter
++from reportlab.pdfgen import canvas
++
++
++def main(argv):
++    if len(argv) not in (3, 4):
++        print(__doc__, file=sys.stderr)
++        return 2
++    src, dst = argv[1], argv[2]
++    text = argv[3] if len(argv) == 4 else dt.date.today().isoformat()
++    try:
++        reader = PdfReader(src)
++        writer = PdfWriter()
++        for page in reader.pages:
++            w, h = float(page.mediabox.width), float(page.mediabox.height)
++            buf = io.BytesIO()
++            c = canvas.Canvas(buf, pagesize=(w, h))
++            c.setFont("Helvetica", 8)
++            c.drawRightString(w - 14 * 2.835, h - 7 * 2.835, text)   # 14 mm from right, 7 mm from top
++            c.save()
++            buf.seek(0)
++            attached = writer.add_page(page)          # attach first (pypdf >= 7), then merge
++            attached.merge_page(PdfReader(buf).pages[0])
++        with open(dst, "wb") as f:
++            writer.write(f)
++    except Exception as e:  # unreadable or encrypted PDF
++        print(f"stamp.py: {type(e).__name__}: {e}", file=sys.stderr)
++        return 2
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main(sys.argv))
