@@ -19,6 +19,7 @@ lint:
 
 test: lint
 	$(BASH) tests/run.sh
+	python3 -I tests/test_soak_review.py
 
 # Files are copied to a private temp dir on the target and installed with `install`
 # (never executed from there: /tmp is often mounted noexec).
