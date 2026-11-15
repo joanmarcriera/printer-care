@@ -117,6 +117,25 @@ class Verdicts(unittest.TestCase):
         self.assertEqual(r["rows"]["pi"]["verdict"], "CONTROL")
         self.assertEqual(r["overall"], "GO")
 
+    def test_target_with_short_history_cannot_ride_on_the_control_window(self):
+        # colour has only 3 days of data while the Pi control covers 28: window coverage alone said GO
+        b = bundle()
+        for kind, step in (("icmp", 15), ("ipp", 60), ("rtt", 15)):
+            b["series"][kind]["colour"] = series(3, step, value=0.03 if kind == "rtt" else 1.0, end=END)
+        r = ev(b)
+        self.assertEqual(r["rows"]["colour"]["verdict"], "KEEP SOAKING")
+        self.assertNotEqual(r["overall"], "GO")
+
+    def test_prometheus_hole_inside_the_window_is_not_a_clean_run(self):
+        # 28 d span but a 10 d hole (Prometheus down): the missing days must not count as 100 % success
+        b = bundle()
+        hole_from, hole_to = END - 20 * 86400, END - 10 * 86400
+        for kind in ("icmp", "ipp", "rtt"):
+            b["series"][kind]["black"] = [p for p in b["series"][kind]["black"] if not hole_from <= p[0] < hole_to]
+        r = ev(b)
+        self.assertEqual(r["rows"]["black"]["verdict"], "KEEP SOAKING")
+        self.assertNotEqual(r["overall"], "GO")
+
     def test_missing_data_never_go(self):
         b = bundle()
         b["series"]["rtt"].pop("colour")

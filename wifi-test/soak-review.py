@@ -100,6 +100,19 @@ def coverage_days(bundle):
     return (bundle["end"] - min(firsts)) / 86400 if firsts else 0.0
 
 
+def target_data_ok(bundle, name, min_days, tolerance=0.95):
+    """True if THIS target's icmp and :631 series span the minimum window with >= 95 % of the expected
+    samples (a Prometheus outage or a late-added target must not read as 100 % success)."""
+    end = bundle["end"]
+    for kind in ("icmp", "ipp"):
+        pts = bundle["series"].get(kind, {}).get(name, [])
+        if not pts or pts[0][0] > end - (min_days - 0.5) * 86400:
+            return False
+        if len(pts) < tolerance * (end - pts[0][0]) / STEPS[kind]:
+            return False
+    return True
+
+
 def evaluate(bundle, targets, soak_start, min_days, now=None):
     """bundle = {"end": ts, "series": {kind: {name: [[ts,v],..]}}}."""
     end = bundle["end"]
@@ -131,11 +144,12 @@ def evaluate(bundle, targets, soak_start, min_days, now=None):
         failed = [c["label"] for c in r["checks"] if c["ok"] is False]
         missing = [c for c in r["checks"] if c["ok"] is None]
         r["failed"] = failed
+        r["data_ok"] = target_data_ok(bundle, name, min_days)
         if name == CONTROL:
             r["verdict"] = "CONTROL"
         elif failed:
             r["verdict"] = "NO-GO" if mature else "KEEP SOAKING"
-        elif missing or not mature:
+        elif missing or not mature or not r["data_ok"]:
             r["verdict"] = "KEEP SOAKING"
         else:
             r["verdict"] = "GO"
@@ -167,6 +181,8 @@ def render(res, md=False):
     out.append("")
     for name, r in res["rows"].items():
         out.append(f"{name}: {r['verdict']}" + (f"  (failed: {'; '.join(r['failed'])})" if r["failed"] else ""))
+        if not r["data_ok"] and name != CONTROL and res["mature"]:
+            out.append("  NOTE  this target's series is shorter or has gaps (<95 % of expected samples): no GO")
         for c in r["checks"]:
             mark = {True: "PASS", False: "FAIL", None: "n/a "}[c["ok"]]
             out.append(f"  {mark}  {c['label']:<34} {c['value'] if c['value'] else 'no data'}")

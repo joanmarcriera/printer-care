@@ -24,8 +24,8 @@ Exit code: 0 GO | 1 KEEP SOAKING (nothing failing yet) | 2 NO-GO | 3 input error
 | Soak length and data window | >= 28 days | task wording "4+ weeks" in <https://familia.riera.co.uk/tasks/3711>; start 2026-10-21 (`--soak-start`, `--min-days`) |
 
 GO needs every check PASS **and** a soak age and data window of 28 days. Before that, a FAIL reads KEEP SOAKING (exit 4); with a full
-window, a FAIL reads NO-GO; missing data is never GO. Outage = consecutive failed samples (each counts one probe step; a data gap does not
+window, a FAIL reads NO-GO; missing data is never GO. Each Wi-Fi target must itself have a series spanning the window with >= 95 % of the expected samples (a Prometheus outage or a late-added target never reads as 100 % success). Outage = consecutive failed samples (each counts one probe step; a data gap does not
 bridge two outages), so it is accurate to one step.
 Weeks 1 and 2 suggest the RTT p95 threshold is unattainable over Wi-Fi power-save; recalibrate it in `THRESHOLDS` (top of the script)
 only as a deliberate decision, not to turn a run green. The F4 weekly test print is a manual line in the output.
-Tests: `make test` (22 tests, sample logs synthesised in `tests/test_soak_review.py`).
+Tests: `make test` (24 tests, sample logs synthesised in `tests/test_soak_review.py`).
